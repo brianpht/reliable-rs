@@ -1,0 +1,33 @@
+[package]
+name = "reliable-rs"
+version = "0.1.0"
+edition = "2024"
+description = "A pure Rust implementation of reliable UDP protocol for real-time games and applications"
+keywords = ["networking", "udp", "reliable", "gamedev", "realtime"]
+categories = ["network-programming", "game-development"]
+
+[features]
+default = []
+std = []
+
+[dependencies]
+thiserror = "2.0.18"
+log = "0.4"
+
+[dev-dependencies]
+rand = "0.10.0"
+env_logger = "0.11"
+criterion = "0.8.2"
+
+[[bench]]
+name = "throughput"
+harness = false
+
+[[example]]
+name = "basic"
+
+[[example]]
+name = "client_server"
+
+[[example]]
+name = "with_packet_loss"
