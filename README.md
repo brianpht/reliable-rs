@@ -121,12 +121,31 @@ Benchmarks on a modern x86_64 system:
 
 | Operation | Time | Throughput |
 |-----------|------|------------|
-| 64 byte packet | 115 ns | 530 MiB/s |
-| 512 byte packet | 119 ns | 4.0 GiB/s |
-| 4 KB fragmented | 524 ns | 7.3 GiB/s |
-| Header write | 3.2 ns | - |
-| Header read | 1.4 ns | - |
-| Full ACK roundtrip | 4.9 µs | - |
+| 64 byte packet | 80 ns | 763 MiB/s |
+| 512 byte packet | 83 ns | 5.7 GiB/s |
+| 4 KB fragmented | 558 ns | 6.8 GiB/s |
+| Header write | 1.7 ns | - |
+| Header read | 1.0 ns | - |
+| Full ACK roundtrip | 4.2 µs | - |
+
+## Performance Design
+
+This library is built with deterministic, low-latency performance as a core design principle. Key architectural decisions include:
+
+- **Allocation-free hot path**: Zero heap allocations during send/receive operations
+- **Lock-free design**: Single-writer model with no mutex contention
+- **Ring buffers with bitwise indexing**: O(1) operations using power-of-two sizes
+- **Cache-oriented data structures**: Hot fields aligned to minimize cache misses
+- **Branch-predictable code**: Fast path first, error handlers marked `#[cold]`
+- **Little-endian wire format**: Zero-overhead on x86_64 systems
+- **Sequence arithmetic**: Proper wrapping arithmetic with half-range comparison
+
+**Performance Targets:**
+- Small packet latency: < 200ns ✅ (achieved ~80ns)
+- Steady-state allocations: Zero
+- Cache misses: None in hot path
+
+For detailed performance design principles, architecture decisions, and optimization guidelines, see [docs/performance_design.md](docs/performance_design.md).
 
 ## Integration with Network Libraries
 

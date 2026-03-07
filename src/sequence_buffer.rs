@@ -24,7 +24,11 @@ pub(crate) struct SequenceBuffer<T: Clone + Default> {
 
 impl<T: Clone + Default> SequenceBuffer<T> {
     /// Create a new sequence buffer with the given size
+    /// 
+    /// # Panics
+    /// Panics if size is not a power of two (required for O(1) bitwise indexing)
     pub fn new(size: usize) -> Self {
+        assert!(size > 0 && size.is_power_of_two(), "SequenceBuffer size must be a power of two");
         Self {
             sequence: 0,
             entries: vec![None; size],
@@ -37,6 +41,7 @@ impl<T: Clone + Default> SequenceBuffer<T> {
     }
 
     /// Get the buffer size
+    #[allow(dead_code)]
     pub fn size(&self) -> usize {
         self.entries.len()
     }
@@ -50,6 +55,7 @@ impl<T: Clone + Default> SequenceBuffer<T> {
     }
 
     /// Check if a sequence number can be inserted
+    #[inline]
     pub fn can_insert(&self, sequence: u16) -> bool {
         let num_entries = self.entries.len() as u16;
         !sequence_less_than(sequence, self.sequence.wrapping_sub(num_entries))
@@ -58,6 +64,7 @@ impl<T: Clone + Default> SequenceBuffer<T> {
     /// Insert an entry at the given sequence number
     ///
     /// Returns a mutable reference to the data if successful
+    #[inline]
     pub fn insert(&mut self, sequence: u16) -> Option<&mut T> {
         if !self.can_insert(sequence) {
             return None;
@@ -79,6 +86,7 @@ impl<T: Clone + Default> SequenceBuffer<T> {
     }
 
     /// Insert with existing data
+    #[allow(dead_code)]
     pub fn insert_with(&mut self, sequence: u16, data: T) -> bool {
         if let Some(entry_data) = self.insert(sequence) {
             *entry_data = data;
@@ -89,6 +97,7 @@ impl<T: Clone + Default> SequenceBuffer<T> {
     }
 
     /// Find an entry by sequence number
+    #[inline]
     pub fn find(&self, sequence: u16) -> Option<&T> {
         let index = self.index(sequence);
         self.entries[index]
@@ -98,6 +107,7 @@ impl<T: Clone + Default> SequenceBuffer<T> {
     }
 
     /// Find a mutable entry by sequence number
+    #[inline]
     pub fn find_mut(&mut self, sequence: u16) -> Option<&mut T> {
         let index = self.index(sequence);
         self.entries[index]
@@ -107,6 +117,7 @@ impl<T: Clone + Default> SequenceBuffer<T> {
     }
 
     /// Remove an entry by sequence number
+    #[inline]
     pub fn remove(&mut self, sequence: u16) -> Option<T> {
         let index = self.index(sequence);
         if let Some(entry) = self.entries[index].take() {
@@ -120,6 +131,7 @@ impl<T: Clone + Default> SequenceBuffer<T> {
     }
 
     /// Check if an entry exists at the given sequence
+    #[inline]
     pub fn exists(&self, sequence: u16) -> bool {
         let index = self.index(sequence);
         self.entries[index]
@@ -148,6 +160,7 @@ impl<T: Clone + Default> SequenceBuffer<T> {
     }
 
     /// Iterate over all valid entries
+    #[allow(dead_code)]
     pub fn iter(&self) -> impl Iterator<Item = (u16, &T)> {
         self.entries
             .iter()
@@ -155,6 +168,7 @@ impl<T: Clone + Default> SequenceBuffer<T> {
     }
 
     /// Iterate over entries in a sequence range
+    #[allow(dead_code)]
     pub fn iter_range(&self, start: u16, end: u16) -> impl Iterator<Item = (u16, &T)> + '_ {
         let mut seq = start;
         std::iter::from_fn(move || {
@@ -170,9 +184,11 @@ impl<T: Clone + Default> SequenceBuffer<T> {
     }
 
     /// Calculate index in the buffer for a sequence number
+    /// Uses bitwise AND instead of modulo for O(1) performance
+    /// REQUIRES: capacity must be power-of-two
     #[inline]
     fn index(&self, sequence: u16) -> usize {
-        (sequence as usize) % self.entries.len()
+        (sequence as usize) & (self.entries.len() - 1)
     }
 
     /// Remove entries in a range (exclusive of end)

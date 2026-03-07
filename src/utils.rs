@@ -36,6 +36,7 @@ pub fn sequence_less_than(s1: u16, s2: u16) -> bool {
 }
 
 /// Calculate the number of bits required to represent a value
+#[allow(dead_code)]
 #[inline]
 pub(crate) fn bits_required(min: u32, max: u32) -> u32 {
     if min == max {

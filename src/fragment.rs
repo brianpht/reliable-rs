@@ -17,7 +17,27 @@ pub struct FragmentHeader {
 }
 
 impl FragmentHeader {
+    /// Write fragment header to a fixed-size buffer slice (allocation-free)
+    ///
+    /// Returns the number of bytes written, or None if buffer is too small
+    #[allow(dead_code)]
+    #[inline]
+    pub fn write_to_slice(&self, buffer: &mut [u8]) -> Option<usize> {
+        if buffer.len() < FRAGMENT_HEADER_BYTES {
+            return None;
+        }
+        // Prefix byte with fragment flag set (bit 0 = 1)
+        buffer[0] = 1;
+        let seq_bytes = self.sequence.to_le_bytes();
+        buffer[1] = seq_bytes[0];
+        buffer[2] = seq_bytes[1];
+        buffer[3] = self.fragment_id;
+        buffer[4] = self.num_fragments;
+        Some(FRAGMENT_HEADER_BYTES)
+    }
+
     /// Write fragment header to buffer
+    #[inline]
     pub fn write(&self, buffer: &mut Vec<u8>) -> usize {
         // Prefix byte with fragment flag set (bit 0 = 1)
         buffer.push(1);
@@ -28,6 +48,7 @@ impl FragmentHeader {
     }
 
     /// Read fragment header from buffer
+    #[inline]
     pub fn read(data: &[u8]) -> Option<(Self, usize)> {
         if data.len() < FRAGMENT_HEADER_BYTES {
             return None;
@@ -54,7 +75,7 @@ impl FragmentHeader {
 }
 
 /// Data for reassembling a fragmented packet
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(crate) struct ReassemblyData {
     /// Sequence number
     pub sequence: u16,
@@ -72,19 +93,6 @@ pub(crate) struct ReassemblyData {
     pub fragments: Vec<Vec<u8>>,
 }
 
-impl Default for ReassemblyData {
-    fn default() -> Self {
-        Self {
-            sequence: 0,
-            ack: 0,
-            ack_bits: 0,
-            num_fragments: 0,
-            num_fragments_received: 0,
-            fragment_received: [0; 8],
-            fragments: Vec::new(),
-        }
-    }
-}
 
 impl ReassemblyData {
     /// Check if a fragment has been received
@@ -163,11 +171,11 @@ impl FragmentReassemblyBuffer {
         // Get or create reassembly entry
         let is_new = !self.buffer.exists(header.sequence);
 
-        if is_new {
-            if self.buffer.insert(header.sequence).is_none() {
-                log::warn!("Failed to insert reassembly entry");
-                return None;
-            }
+        if is_new
+            && self.buffer.insert(header.sequence).is_none()
+        {
+            log::warn!("Failed to insert reassembly entry");
+            return None;
         }
 
         let entry = self.buffer.find_mut(header.sequence)?;
@@ -237,7 +245,7 @@ pub fn fragment_packet(
         return None;
     }
 
-    let num_fragments = (data.len() + fragment_size - 1) / fragment_size;
+    let num_fragments = data.len().div_ceil(fragment_size);
 
     if num_fragments > max_fragments || num_fragments > 255 {
         return None;

@@ -208,55 +208,74 @@ impl Endpoint {
         }
     }
 
-fn receive_regular_packet(&mut self, data: &[u8]) {
-    let (header, header_size) = match PacketHeader::read(data) {
-        Some(h) => h,
-        None => {
-            log::warn!("Invalid packet header");
-            self.counters.packets_invalid += 1;
+    #[inline]
+    fn receive_regular_packet(&mut self, data: &[u8]) {
+        let (header, header_size) = match PacketHeader::read(data) {
+            Some(h) => h,
+            None => {
+                self.handle_invalid_packet();
+                return;
+            }
+        };
+
+        // Check if we can accept this sequence (not too old)
+        if !self.received_packets.can_insert(header.sequence) {
+            self.handle_stale_packet(header.sequence);
             return;
         }
-    };
 
-    // Check if we can accept this sequence (not too old)
-    if !self.received_packets.can_insert(header.sequence) {
-        log::debug!("Stale packet: sequence {}", header.sequence);
+        // Check for duplicate packet
+        if self.received_packets.exists(header.sequence) {
+            self.handle_duplicate_packet(header.sequence);
+            return;
+        }
+
+        self.counters.packets_received += 1;
+
+        // Track received packet
+        if let Some(recv_data) = self.received_packets.insert(header.sequence) {
+            recv_data.time = self.time;
+            recv_data.packet_bytes = (self.config.packet_header_size + data.len()) as u32;
+        }
+
+        // Process acknowledgments
+        self.process_acks(header.ack, header.ack_bits);
+
+        // Extract payload
+        let payload = &data[header_size..];
+        if !payload.is_empty() {
+            self.incoming_packets
+                .push_back((header.sequence, payload.to_vec()));
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn handle_invalid_packet(&mut self) {
+        log::warn!("Invalid packet header");
+        self.counters.packets_invalid += 1;
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn handle_stale_packet(&mut self, sequence: u16) {
+        log::debug!("Stale packet: sequence {}", sequence);
         self.counters.packets_stale += 1;
-        return;
     }
 
-    // Check for duplicate packet
-    if self.received_packets.exists(header.sequence) {
-        log::debug!("Duplicate packet: sequence {}", header.sequence);
+    #[cold]
+    #[inline(never)]
+    fn handle_duplicate_packet(&mut self, sequence: u16) {
+        log::debug!("Duplicate packet: sequence {}", sequence);
         self.counters.packets_stale += 1;
-        return;
     }
 
-    self.counters.packets_received += 1;
-
-    // Track received packet
-    if let Some(recv_data) = self.received_packets.insert(header.sequence) {
-        recv_data.time = self.time;
-        recv_data.packet_bytes = (self.config.packet_header_size + data.len()) as u32;
-    }
-
-    // Process acknowledgments
-    self.process_acks(header.ack, header.ack_bits);
-
-    // Extract payload
-    let payload = &data[header_size..];
-    if !payload.is_empty() {
-        self.incoming_packets
-            .push_back((header.sequence, payload.to_vec()));
-    }
-}
-
+    #[inline]
     fn receive_fragment(&mut self, data: &[u8]) {
         let (frag_header, frag_header_size) = match FragmentHeader::read(data) {
             Some(h) => h,
             None => {
-                log::warn!("Invalid fragment header");
-                self.counters.fragments_invalid += 1;
+                self.handle_invalid_fragment();
                 return;
             }
         };
@@ -277,8 +296,7 @@ fn receive_regular_packet(&mut self, data: &[u8]) {
                 // Process acks from first fragment
                 self.process_acks(ack, ack_bits);
             } else {
-                log::warn!("Invalid packet header in first fragment");
-                self.counters.fragments_invalid += 1;
+                self.handle_invalid_fragment_packet_header();
                 return;
             }
         }
@@ -304,28 +322,43 @@ fn receive_regular_packet(&mut self, data: &[u8]) {
         }
     }
 
+    #[cold]
+    #[inline(never)]
+    fn handle_invalid_fragment(&mut self) {
+        log::warn!("Invalid fragment header");
+        self.counters.fragments_invalid += 1;
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn handle_invalid_fragment_packet_header(&mut self) {
+        log::warn!("Invalid packet header in first fragment");
+        self.counters.fragments_invalid += 1;
+    }
+
+    #[inline]
     fn process_acks(&mut self, ack: u16, ack_bits: u32) {
         for i in 0..32 {
             if (ack_bits & (1 << i)) != 0 {
                 let ack_sequence = ack.wrapping_sub(i as u16);
 
-                if let Some(sent_data) = self.sent_packets.find_mut(ack_sequence) {
-                    if !sent_data.acked {
-                        sent_data.acked = true;
-                        self.acks.push(ack_sequence);
-                        self.counters.packets_acked += 1;
+                if let Some(sent_data) = self.sent_packets.find_mut(ack_sequence)
+                    && !sent_data.acked
+                {
+                    sent_data.acked = true;
+                    self.acks.push(ack_sequence);
+                    self.counters.packets_acked += 1;
 
-                        // Update RTT
-                        let rtt_sample = ((self.time - sent_data.time) * 1000.0) as f32;
-                        if self.rtt == 0.0 {
-                            self.rtt = rtt_sample;
-                        } else {
-                            self.rtt = smooth_value(
-                                self.rtt,
-                                rtt_sample,
-                                self.config.rtt_smoothing_factor,
-                            );
-                        }
+                    // Update RTT
+                    let rtt_sample = ((self.time - sent_data.time) * 1000.0) as f32;
+                    if self.rtt == 0.0 {
+                        self.rtt = rtt_sample;
+                    } else {
+                        self.rtt = smooth_value(
+                            self.rtt,
+                            rtt_sample,
+                            self.config.rtt_smoothing_factor,
+                        );
                     }
                 }
             }
@@ -368,10 +401,10 @@ fn receive_regular_packet(&mut self, data: &[u8]) {
 
         for i in 0..num_samples {
             let seq = base.wrapping_add(i as u16);
-            if let Some(data) = self.sent_packets.find(seq) {
-                if !data.acked {
-                    num_dropped += 1;
-                }
+            if let Some(data) = self.sent_packets.find(seq)
+                && !data.acked
+            {
+                num_dropped += 1;
             }
         }
 
@@ -451,12 +484,12 @@ fn receive_regular_packet(&mut self, data: &[u8]) {
 
         for i in 0..buffer_size {
             let seq = base.wrapping_add(i as u16);
-            if let Some(data) = self.sent_packets.find(seq) {
-                if data.acked {
-                    acked_bytes += data.packet_bytes as u64;
-                    acked_start_time = acked_start_time.min(data.time);
-                    acked_end_time = acked_end_time.max(data.time);
-                }
+            if let Some(data) = self.sent_packets.find(seq)
+                && data.acked
+            {
+                acked_bytes += data.packet_bytes as u64;
+                acked_start_time = acked_start_time.min(data.time);
+                acked_end_time = acked_end_time.max(data.time);
             }
         }
 

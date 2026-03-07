@@ -98,12 +98,16 @@ impl EndpointConfig {
             ));
         }
 
-        if self.sent_packets_buffer_size == 0 {
-            return Err("sent_packets_buffer_size must be > 0".to_string());
+        if self.sent_packets_buffer_size == 0 || !self.sent_packets_buffer_size.is_power_of_two() {
+            return Err("sent_packets_buffer_size must be a power of two".to_string());
         }
 
-        if self.received_packets_buffer_size == 0 {
-            return Err("received_packets_buffer_size must be > 0".to_string());
+        if self.received_packets_buffer_size == 0 || !self.received_packets_buffer_size.is_power_of_two() {
+            return Err("received_packets_buffer_size must be a power of two".to_string());
+        }
+
+        if self.fragment_reassembly_buffer_size == 0 || !self.fragment_reassembly_buffer_size.is_power_of_two() {
+            return Err("fragment_reassembly_buffer_size must be a power of two".to_string());
         }
 
         if !(0.0..=1.0).contains(&self.rtt_smoothing_factor) {

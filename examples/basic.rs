@@ -41,7 +41,7 @@ fn main() {
         // Server sends response
         server.send_packet(b"ACK");
 
-        for (seq, data) in server.take_outgoing_packets() {
+        for (_seq, data) in server.take_outgoing_packets() {
             client.receive_packet(&data);
         }
 

@@ -24,9 +24,88 @@ impl PacketHeader {
         }
     }
 
+    /// Write the packet header to a fixed-size buffer slice (allocation-free)
+    ///
+    /// Returns the number of bytes written, or None if buffer is too small
+    /// Buffer must be at least MAX_PACKET_HEADER_BYTES (9 bytes)
+    #[allow(dead_code)]
+    #[inline]
+    pub fn write_to_slice(&self, buffer: &mut [u8]) -> Option<usize> {
+        if buffer.len() < MAX_PACKET_HEADER_BYTES {
+            return None;
+        }
+
+        let mut pos = 0;
+
+        // Calculate prefix byte
+        let mut prefix_byte: u8 = 0;
+
+        // Bits 1-4: which ack_bits bytes to include (if not all 0xFF)
+        if (self.ack_bits & 0x000000FF) != 0x000000FF {
+            prefix_byte |= 1 << 1;
+        }
+        if (self.ack_bits & 0x0000FF00) != 0x0000FF00 {
+            prefix_byte |= 1 << 2;
+        }
+        if (self.ack_bits & 0x00FF0000) != 0x00FF0000 {
+            prefix_byte |= 1 << 3;
+        }
+        if (self.ack_bits & 0xFF000000) != 0xFF000000 {
+            prefix_byte |= 1 << 4;
+        }
+
+        // Bit 5: sequence difference fits in one byte
+        let sequence_diff = self.sequence_diff();
+        if sequence_diff <= 255 {
+            prefix_byte |= 1 << 5;
+        }
+
+        // Write prefix byte
+        buffer[pos] = prefix_byte;
+        pos += 1;
+
+        // Write sequence (always 2 bytes, little-endian)
+        let seq_bytes = self.sequence.to_le_bytes();
+        buffer[pos] = seq_bytes[0];
+        buffer[pos + 1] = seq_bytes[1];
+        pos += 2;
+
+        // Write ack (1 or 2 bytes)
+        if sequence_diff <= 255 {
+            buffer[pos] = sequence_diff as u8;
+            pos += 1;
+        } else {
+            let ack_bytes = self.ack.to_le_bytes();
+            buffer[pos] = ack_bytes[0];
+            buffer[pos + 1] = ack_bytes[1];
+            pos += 2;
+        }
+
+        // Write ack_bits (0-4 bytes, only non-0xFF bytes)
+        if (self.ack_bits & 0x000000FF) != 0x000000FF {
+            buffer[pos] = (self.ack_bits & 0xFF) as u8;
+            pos += 1;
+        }
+        if (self.ack_bits & 0x0000FF00) != 0x0000FF00 {
+            buffer[pos] = ((self.ack_bits >> 8) & 0xFF) as u8;
+            pos += 1;
+        }
+        if (self.ack_bits & 0x00FF0000) != 0x00FF0000 {
+            buffer[pos] = ((self.ack_bits >> 16) & 0xFF) as u8;
+            pos += 1;
+        }
+        if (self.ack_bits & 0xFF000000) != 0xFF000000 {
+            buffer[pos] = ((self.ack_bits >> 24) & 0xFF) as u8;
+            pos += 1;
+        }
+
+        Some(pos)
+    }
+
     /// Write the packet header to a buffer
     ///
     /// Returns the number of bytes written
+    #[inline]
     pub fn write(&self, buffer: &mut Vec<u8>) -> usize {
         let start_len = buffer.len();
 
@@ -88,6 +167,7 @@ impl PacketHeader {
     /// Read a packet header from a buffer
     ///
     /// Returns the header and the number of bytes read, or None if invalid
+    #[inline]
     pub fn read(data: &[u8]) -> Option<(Self, usize)> {
         if data.len() < 3 {
             return None;
