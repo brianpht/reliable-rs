@@ -84,11 +84,11 @@ Benchmarks are the final authority.
 
 | Metric                  | Target    | Current   | Status |
 | ----------------------- | --------- | --------- | ------ |
-| Small packet latency    | < 200 ns  | 80 ns     | ✅      |
-| Header read             | < 5 ns    | 1.0 ns    | ✅      |
-| Header write            | < 10 ns   | 1.7 ns    | ✅      |
-| Throughput (fragmented) | > 5 GiB/s | 6.8 GiB/s | ✅      |
-| Full roundtrip          | < 10 µs   | 4.2 µs    | ✅      |
+| Small packet latency    | < 200 ns  | ~79 ns    | ✅      |
+| Header read             | < 5 ns    | ~1.3 ns   | ✅      |
+| Header write            | < 10 ns   | ~2.9 ns   | ✅      |
+| Throughput (fragmented) | > 5 GiB/s | 7.3 GiB/s | ✅      |
+| Full roundtrip (32 pkts)| < 10 µs   | ~2.9 µs   | ✅      |
 
 ### Regression Policy
 

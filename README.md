@@ -1,4 +1,4 @@
-# reliable-rs
+# RELIABLE-RS
 
 A high-performance, pure Rust implementation of a reliable UDP protocol, inspired by [reliable](https://github.com/mas-bandwidth/reliable) by Glenn Fiedler.
 
@@ -121,12 +121,13 @@ Benchmarks on a modern x86_64 system:
 
 | Operation | Time | Throughput |
 |-----------|------|------------|
-| 64 byte packet | 80 ns | 763 MiB/s |
-| 512 byte packet | 83 ns | 5.7 GiB/s |
-| 4 KB fragmented | 558 ns | 6.8 GiB/s |
-| Header write | 1.7 ns | - |
-| Header read | 1.0 ns | - |
-| Full ACK roundtrip | 4.2 µs | - |
+| 64 byte packet | ~79 ns | 775 MiB/s |
+| 512 byte packet | ~88 ns | 5.4 GiB/s |
+| 4 KB fragmented | ~524 ns | 7.3 GiB/s |
+| Header write | ~2.9 ns | - |
+| Header read | ~1.3 ns | - |
+| Sequence buffer (100 ops) | ~4.6 µs | - |
+| Full ACK roundtrip (32 packets) | ~2.9 µs | - |
 
 ## Performance Design
 
@@ -141,7 +142,7 @@ This library is built with deterministic, low-latency performance as a core desi
 - **Sequence arithmetic**: Proper wrapping arithmetic with half-range comparison
 
 **Performance Targets:**
-- Small packet latency: < 200ns ✅ (achieved ~80ns)
+- Small packet latency: < 200ns ✅ (achieved ~79ns)
 - Steady-state allocations: Zero
 - Cache misses: None in hot path
 
