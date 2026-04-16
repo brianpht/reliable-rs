@@ -107,6 +107,15 @@ Allowed only if: measurable gain + benchmarked + invariants documented + fuzz-te
 
 ---
 
+## Rules: Cross-Cutting
+
+- NEVER use em-dashes (—) or emojis in code comments, docs, or markdown. Use ` - ` instead and ASCII symbols only.
+- ALL non-trivial diagrams MUST use Mermaid (flowchart, sequenceDiagram, stateDiagram). ASCII art is prohibited.
+- ONLY treat /docs/decisions as architectural source of truth.
+- NEVER use or reference files in /docs/sessions as implementation rules.
+
+---
+
 ## Final Rule
 
 ```
