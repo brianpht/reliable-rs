@@ -31,3 +31,6 @@ name = "client_server"
 
 [[example]]
 name = "with_packet_loss"
+
+[[example]]
+name = "udp_loopback"

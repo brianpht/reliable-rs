@@ -208,7 +208,7 @@ cargo test --workspace  -- 60/60 passed
 5. ~~**High:** Implement Step 5 - add `drain_outgoing` / `drain_incoming`, deprecate `take_*`~~ Done
 6. ~~**Medium:** Implement Step 6 - bump to `0.2.0`, migrate all call sites~~ Done
 7. ~~**Medium:** Implement Step 7 - CI sequence, update `docs/performance_design.md`~~ Done
-8. **Low:** After all above: add `std::net::UdpSocket` loopback example as first real I/O baseline
+8. ~~**Low:** After all above: add `std::net::UdpSocket` loopback example as first real I/O baseline~~ Done
 
 ## Files Changed
 
@@ -230,3 +230,5 @@ cargo test --workspace  -- 60/60 passed
 | A | `docs/decisions/ADR-002-process-fragment-queue-param.md` | Step 4 |
 | A | `docs/decisions/ADR-003-bounded-ack-buf.md` | Step 4 |
 | M | `docs/performance_design.md` - updated perf numbers | Step 7 |
+| A | `examples/udp_loopback.rs` - real I/O loopback baseline | Step 8 |
+| M | `Cargo.toml` - registered udp_loopback example | Step 8 |
