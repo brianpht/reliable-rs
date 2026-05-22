@@ -17,19 +17,22 @@
 //! [`EndpointConfig::default`] provides values suitable for a 1 Mbps game
 //! connection with packets up to 16 KB:
 //!
-//! | Field                            | Default  |
-//! |----------------------------------|----------|
-//! | `max_packet_size`                | 16384    |
-//! | `fragment_above`                 | 1024     |
-//! | `fragment_size`                  | 1024     |
-//! | `max_fragments`                  | 16       |
-//! | `sent_packets_buffer_size`       | 256      |
-//! | `received_packets_buffer_size`   | 256      |
-//! | `fragment_reassembly_buffer_size`| 64       |
-//! | `rtt_smoothing_factor`           | 0.0025   |
-//! | `packet_loss_smoothing_factor`   | 0.1      |
-//! | `bandwidth_smoothing_factor`     | 0.1      |
-//! | `packet_header_size`             | 28       |
+//! | Field                              | Default  |
+//! |------------------------------------|----------|
+//! | `max_packet_size`                  | 16384    |
+//! | `fragment_above`                   | 1024     |
+//! | `fragment_size`                    | 1024     |
+//! | `max_fragments`                    | 16       |
+//! | `sent_packets_buffer_size`         | 256      |
+//! | `received_packets_buffer_size`     | 256      |
+//! | `fragment_reassembly_buffer_size`  | 64       |
+//! | `outgoing_queue_size`              | 256      |
+//! | `incoming_queue_size`              | 256      |
+//! | `ack_buffer_size`                  | 256      |
+//! | `rtt_smoothing_factor`             | 0.0025   |
+//! | `packet_loss_smoothing_factor`     | 0.1      |
+//! | `bandwidth_smoothing_factor`       | 0.1      |
+//! | `packet_header_size`               | 28       |
 
 /// Configuration for a reliable UDP endpoint.
 ///

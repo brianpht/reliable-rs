@@ -143,19 +143,22 @@ let config = EndpointConfig {
     sent_packets_buffer_size: 256,           // Power-of-two - sent packet ring buffer
     received_packets_buffer_size: 256,       // Power-of-two - recv packet ring buffer
     fragment_reassembly_buffer_size: 64,     // Power-of-two - reassembly ring buffer
+    outgoing_queue_size: 256,                // Power-of-two - outgoing datagram ring buffer
+    incoming_queue_size: 256,                // Power-of-two - incoming payload ring buffer
+    ack_buffer_size: 256,                    // Bounded ACK sequence buffer
     rtt_smoothing_factor: 0.0025,            // EMA factor for RTT
     packet_loss_smoothing_factor: 0.1,       // EMA factor for packet loss
     bandwidth_smoothing_factor: 0.1,         // EMA factor for bandwidth
     packet_header_size: 28,                  // IP(20) + UDP(8) overhead for bw calc
-    ack_buffer_size: 256,
 };
 
 // Validate before use (checks power-of-two constraints, ranges, etc.)
 config.validate().expect("invalid config");
 ```
 
-> **Note:** `sent_packets_buffer_size`, `received_packets_buffer_size`, and
-> `fragment_reassembly_buffer_size` must be powers of two. The ring-buffer
+> **Note:** `sent_packets_buffer_size`, `received_packets_buffer_size`,
+> `fragment_reassembly_buffer_size`, `outgoing_queue_size`, and
+> `incoming_queue_size` must all be powers of two. The ring-buffer
 > index is `seq & (capacity - 1)`.
 
 ## Network Statistics
@@ -181,6 +184,11 @@ println!(
     "sent={} recv={} acked={} stale={} invalid={}",
     c.packets_sent, c.packets_received, c.packets_acked,
     c.packets_stale, c.packets_invalid
+);
+println!(
+    "too_large_send={} too_large_recv={} frags_sent={} frags_recv={} frags_invalid={}",
+    c.packets_too_large_to_send, c.packets_too_large_to_receive,
+    c.fragments_sent, c.fragments_received, c.fragments_invalid
 );
 ```
 
@@ -268,11 +276,12 @@ For secure connections consider pairing with
 | `src/endpoint.rs`       | `Endpoint` - send/receive, ACK processing, stats     |
 | `src/fragment.rs`       | Fragmentation, reassembly, `FragmentHeader` encoding |
 | `src/packet.rs`         | `PacketHeader` variable-length wire encoding         |
+| `src/packet_queue.rs`   | `PacketQueue` - preallocated slot ring buffer        |
 | `src/sequence_buffer.rs`| Power-of-two ring buffer for packet tracking         |
 | `src/utils.rs`          | Half-range sequence comparison, EMA helper           |
 | `benches/throughput.rs` | Criterion benchmarks                                 |
 | `tests/integration.rs`  | Integration tests                                    |
-| `examples/`             | `basic`, `client_server`, `with_packet_loss`         |
+| `examples/`             | `basic`, `client_server`, `with_packet_loss`, `udp_loopback` |
 
 ## Build Commands
 
