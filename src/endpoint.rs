@@ -120,8 +120,16 @@ pub struct Endpoint {
 
 impl Endpoint {
     /// Create a new endpoint with the given configuration
+    ///
+    /// # Panics
+    ///
+    /// Panics if `config` fails [`EndpointConfig::validate`]. Call
+    /// `config.validate()` first to surface errors without panicking.
     pub fn new(config: EndpointConfig, time: f64) -> Self {
-        let ack_buf = vec![0u16; config.sent_packets_buffer_size].into_boxed_slice();
+        config
+            .validate()
+            .unwrap_or_else(|e| panic!("Invalid EndpointConfig: {e}"));
+        let ack_buf = vec![0u16; config.ack_buffer_size].into_boxed_slice();
         let outgoing_queue =
             PacketQueue::new(config.outgoing_queue_size, config.max_datagram_size());
         let incoming_queue = PacketQueue::new(config.incoming_queue_size, config.max_packet_size);
@@ -731,6 +739,7 @@ mod tests {
         let mut config = EndpointConfig::default();
         config.fragment_above = 100;
         config.fragment_size = 100;
+        config.max_packet_size = config.max_fragments * config.fragment_size; // 16 * 100 = 1600
 
         let mut client = Endpoint::new(config.clone(), 0.0);
         let mut server = Endpoint::new(config, 0.0);
@@ -760,6 +769,7 @@ mod tests {
         let mut config = EndpointConfig::default();
         config.fragment_above = 100;
         config.fragment_size = 100;
+        config.max_packet_size = config.max_fragments * config.fragment_size; // 16 * 100 = 1600
 
         let mut client = Endpoint::new(config.clone(), 0.0);
         let mut server = Endpoint::new(config, 0.0);

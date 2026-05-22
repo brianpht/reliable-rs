@@ -136,30 +136,42 @@ use reliable_rs::EndpointConfig;
 
 let config = EndpointConfig {
     name: "client".to_string(),
-    max_packet_size: 16 * 1024,              // Maximum payload size (bytes)
-    fragment_above: 1024,                    // Fragment packets larger than this
-    max_fragments: 16,                       // Max fragments per packet
+    max_packet_size: 16 * 1024,              // Maximum payload size (bytes); must be <= max_fragments * fragment_size
+    fragment_above: 1024,                    // Fragment packets larger than this; must be <= max_packet_size
+    max_fragments: 16,                       // Max fragments per packet (max 255)
     fragment_size: 1024,                     // Fragment payload size (bytes)
-    sent_packets_buffer_size: 256,           // Power-of-two - sent packet ring buffer
-    received_packets_buffer_size: 256,       // Power-of-two - recv packet ring buffer
-    fragment_reassembly_buffer_size: 64,     // Power-of-two - reassembly ring buffer
+    sent_packets_buffer_size: 256,           // Power-of-two, >= 32 - sent packet ring buffer (loss detection window)
+    received_packets_buffer_size: 256,       // Power-of-two - received packet ring buffer (duplicate detection)
+    fragment_reassembly_buffer_size: 64,     // Power-of-two - reassembly ring buffer slots
     outgoing_queue_size: 256,                // Power-of-two - outgoing datagram ring buffer
     incoming_queue_size: 256,                // Power-of-two - incoming payload ring buffer
-    ack_buffer_size: 256,                    // Bounded ACK sequence buffer
-    rtt_smoothing_factor: 0.0025,            // EMA factor for RTT
-    packet_loss_smoothing_factor: 0.1,       // EMA factor for packet loss
-    bandwidth_smoothing_factor: 0.1,         // EMA factor for bandwidth
-    packet_header_size: 28,                  // IP(20) + UDP(8) overhead for bw calc
+    ack_buffer_size: 256,                    // >= 32 - ACK notification buffer (call clear_acks() once per tick)
+    rtt_smoothing_factor: 0.0025,            // EMA factor for RTT (range 0.0-1.0)
+    packet_loss_smoothing_factor: 0.1,       // EMA factor for packet loss (range 0.0-1.0)
+    bandwidth_smoothing_factor: 0.1,         // EMA factor for bandwidth (range 0.0-1.0)
+    packet_header_size: 28,                  // IP(20) + UDP(8) overhead assumed for bandwidth calc
 };
 
-// Validate before use (checks power-of-two constraints, ranges, etc.)
+// Validate before use - checks all constraints listed below.
+// Endpoint::new() calls this automatically and panics on failure.
 config.validate().expect("invalid config");
 ```
 
-> **Note:** `sent_packets_buffer_size`, `received_packets_buffer_size`,
-> `fragment_reassembly_buffer_size`, `outgoing_queue_size`, and
-> `incoming_queue_size` must all be powers of two. The ring-buffer
-> index is `seq & (capacity - 1)`.
+> **Constraints enforced by `EndpointConfig::validate` (and panicked on by `Endpoint::new`):**
+>
+> | Field | Constraint |
+> |-------|-----------|
+> | `max_packet_size` | `> 0` and `<= max_fragments * fragment_size` |
+> | `fragment_above` | `<= max_packet_size` |
+> | `fragment_size`, `max_fragments` | `> 0` |
+> | `sent_packets_buffer_size` | power-of-two and `>= 32` |
+> | `received_packets_buffer_size` | power-of-two |
+> | `fragment_reassembly_buffer_size` | power-of-two |
+> | `outgoing_queue_size`, `incoming_queue_size` | power-of-two |
+> | `ack_buffer_size` | `>= 32` (one full ACK batch per `receive_packet` call = 32 entries) |
+> | smoothing factors | in `[0.0, 1.0]` |
+>
+> Ring-buffer indices are computed as `seq & (capacity - 1)`, which requires power-of-two capacities.
 
 ## Network Statistics
 

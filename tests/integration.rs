@@ -94,6 +94,7 @@ fn test_large_packet_fragmentation() {
     config.fragment_above = 100;
     config.fragment_size = 100;
     config.max_fragments = 64;
+    config.max_packet_size = config.max_fragments * config.fragment_size; // 64 * 100 = 6400
 
     let mut client = Endpoint::new(config.clone(), 0.0);
     let mut server = Endpoint::new(config, 0.0);
@@ -124,6 +125,7 @@ fn test_out_of_order_fragments() {
     let mut config = EndpointConfig::default();
     config.fragment_above = 50;
     config.fragment_size = 50;
+    config.max_packet_size = config.max_fragments * config.fragment_size; // 16 * 50 = 800
 
     let mut client = Endpoint::new(config.clone(), 0.0);
     let mut server = Endpoint::new(config, 0.0);
@@ -257,6 +259,7 @@ fn test_sequence_wrap_around() {
 fn test_max_packet_size_enforcement() {
     let mut config = EndpointConfig::default();
     config.max_packet_size = 100;
+    config.fragment_above = 100; // must be <= max_packet_size
 
     let mut endpoint = Endpoint::new(config, 0.0);
 

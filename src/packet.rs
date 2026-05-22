@@ -70,11 +70,13 @@ impl PacketHeader {
         }
     }
 
-    /// Write the packet header to a fixed-size buffer slice (allocation-free)
+    /// Write the packet header to a fixed-size buffer slice (allocation-free).
     ///
-    /// Returns the number of bytes written, or None if buffer is too small
-    /// Buffer must be at least MAX_PACKET_HEADER_BYTES (9 bytes)
-    #[allow(dead_code)]
+    /// Returns the number of bytes written, or `None` if the buffer is too
+    /// small. Buffer must be at least [`MAX_PACKET_HEADER_BYTES`] (9 bytes).
+    ///
+    /// This is the hot-path method used by [`Endpoint`](crate::endpoint::Endpoint).
+    /// Prefer this over [`write`](Self::write) whenever possible.
     #[inline]
     pub fn write_to_slice(&self, buffer: &mut [u8]) -> Option<usize> {
         if buffer.len() < MAX_PACKET_HEADER_BYTES {

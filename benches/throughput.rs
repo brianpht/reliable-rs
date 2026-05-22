@@ -62,27 +62,29 @@ fn benchmark_send_receive(c: &mut Criterion) {
 }
 
 fn benchmark_packet_header(c: &mut Criterion) {
-    use reliable_rs::PacketHeader;
+    use reliable_rs::{MAX_PACKET_HEADER_BYTES, PacketHeader};
 
     let mut group = c.benchmark_group("packet_header");
 
+    // Measures the hot-path write_to_slice (zero-alloc, stack buffer).
     group.bench_function("write", |b| {
         let header = PacketHeader::new(1000, 998, 0xFFFFFFFF);
-        let mut buffer = Vec::with_capacity(16);
+        let mut buffer = [0u8; MAX_PACKET_HEADER_BYTES];
 
         b.iter(|| {
-            buffer.clear();
-            let written = black_box(&header).write(&mut buffer);
+            let written = black_box(&header).write_to_slice(&mut buffer);
             black_box(written)
         });
     });
 
     group.bench_function("read", |b| {
+        // Setup: encode once outside the measured loop.
         let header = PacketHeader::new(1000, 998, 0xFFFFFFFF);
-        let mut buffer = Vec::new();
-        header.write(&mut buffer);
+        let mut setup_buf = [0u8; MAX_PACKET_HEADER_BYTES];
+        let written = header.write_to_slice(&mut setup_buf).unwrap();
+        let encoded = &setup_buf[..written];
 
-        b.iter(|| black_box(PacketHeader::read(black_box(&buffer))));
+        b.iter(|| black_box(PacketHeader::read(black_box(encoded))));
     });
 
     group.finish();

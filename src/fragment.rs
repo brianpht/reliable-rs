@@ -64,10 +64,12 @@ pub struct FragmentHeader {
 }
 
 impl FragmentHeader {
-    /// Write fragment header to a fixed-size buffer slice (allocation-free)
+    /// Write fragment header to a fixed-size buffer slice (allocation-free).
     ///
-    /// Returns the number of bytes written, or None if buffer is too small
-    #[allow(dead_code)]
+    /// Returns the number of bytes written, or `None` if the buffer is too
+    /// small. Buffer must be at least [`FRAGMENT_HEADER_BYTES`] (5 bytes).
+    ///
+    /// This is the hot-path method used by [`Endpoint`](crate::endpoint::Endpoint).
     #[inline]
     pub fn write_to_slice(&self, buffer: &mut [u8]) -> Option<usize> {
         if buffer.len() < FRAGMENT_HEADER_BYTES {
@@ -81,18 +83,6 @@ impl FragmentHeader {
         buffer[3] = self.fragment_id;
         buffer[4] = self.num_fragments;
         Some(FRAGMENT_HEADER_BYTES)
-    }
-
-    /// Write fragment header to buffer
-    #[allow(dead_code)]
-    #[inline]
-    pub fn write(&self, buffer: &mut Vec<u8>) -> usize {
-        // Prefix byte with fragment flag set (bit 0 = 1)
-        buffer.push(1);
-        buffer.extend_from_slice(&self.sequence.to_le_bytes());
-        buffer.push(self.fragment_id);
-        buffer.push(self.num_fragments);
-        FRAGMENT_HEADER_BYTES
     }
 
     /// Read fragment header from buffer
@@ -459,10 +449,10 @@ mod tests {
             num_fragments: 16,
         };
 
-        let mut buffer = Vec::new();
-        header.write(&mut buffer);
+        let mut buffer = [0u8; FRAGMENT_HEADER_BYTES];
+        let written = header.write_to_slice(&mut buffer).unwrap();
 
-        let (parsed, size) = FragmentHeader::read(&buffer).unwrap();
+        let (parsed, size) = FragmentHeader::read(&buffer[..written]).unwrap();
         assert_eq!(size, FRAGMENT_HEADER_BYTES);
         assert_eq!(header, parsed);
     }

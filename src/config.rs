@@ -4,41 +4,56 @@
 //! All buffer sizes are fixed at that point; the library never reallocates
 //! during steady-state operation.
 //!
-//! ## Power-of-Two Requirement
+//! [`Endpoint::new`] calls [`EndpointConfig::validate`] automatically and panics
+//! if any constraint is violated, so invalid configs are detected at construction
+//! time rather than producing silent misbehavior later.
 //!
-//! `sent_packets_buffer_size`, `received_packets_buffer_size`, and
-//! `fragment_reassembly_buffer_size` **must** be powers of two. The ring-buffer
-//! index is computed as `seq & (capacity - 1)`, which is only correct when
-//! capacity is a power of two. [`EndpointConfig::validate`] enforces this and
-//! returns an `Err` if any constraint is violated.
+//! ## Constraints
+//!
+//! | Field | Constraint |
+//! |-------|-----------|
+//! | `max_packet_size` | `> 0` and `<= max_fragments * fragment_size` |
+//! | `fragment_above` | `<= max_packet_size` |
+//! | `fragment_size`, `max_fragments` | `> 0` |
+//! | `sent_packets_buffer_size` | power-of-two and `>= 32` |
+//! | `received_packets_buffer_size` | power-of-two |
+//! | `fragment_reassembly_buffer_size` | power-of-two |
+//! | `outgoing_queue_size`, `incoming_queue_size` | power-of-two |
+//! | `ack_buffer_size` | `>= 32` (one full ACK batch per `receive_packet` call) |
+//! | smoothing factors | in `[0.0, 1.0]` |
+//!
+//! Ring-buffer indices are computed as `seq & (capacity - 1)`, which requires
+//! power-of-two capacities. The `>= 32` minimums come from the ACK bitfield
+//! window: each received packet can acknowledge up to 32 sequences at once.
 //!
 //! ## Defaults
 //!
 //! [`EndpointConfig::default`] provides values suitable for a 1 Mbps game
 //! connection with packets up to 16 KB:
 //!
-//! | Field                              | Default  |
-//! |------------------------------------|----------|
-//! | `max_packet_size`                  | 16384    |
-//! | `fragment_above`                   | 1024     |
-//! | `fragment_size`                    | 1024     |
-//! | `max_fragments`                    | 16       |
-//! | `sent_packets_buffer_size`         | 256      |
-//! | `received_packets_buffer_size`     | 256      |
-//! | `fragment_reassembly_buffer_size`  | 64       |
-//! | `outgoing_queue_size`              | 256      |
-//! | `incoming_queue_size`              | 256      |
-//! | `ack_buffer_size`                  | 256      |
-//! | `rtt_smoothing_factor`             | 0.0025   |
-//! | `packet_loss_smoothing_factor`     | 0.1      |
-//! | `bandwidth_smoothing_factor`       | 0.1      |
-//! | `packet_header_size`               | 28       |
+//! | Field                              | Default  | Constraint                         |
+//! |------------------------------------|----------|------------------------------------|
+//! | `max_packet_size`                  | 16384    | `<= max_fragments * fragment_size` |
+//! | `fragment_above`                   | 1024     | `<= max_packet_size`               |
+//! | `fragment_size`                    | 1024     | `> 0`                              |
+//! | `max_fragments`                    | 16       | `> 0`, max 255                     |
+//! | `sent_packets_buffer_size`         | 256      | power-of-two, `>= 32`              |
+//! | `received_packets_buffer_size`     | 256      | power-of-two                       |
+//! | `fragment_reassembly_buffer_size`  | 64       | power-of-two                       |
+//! | `outgoing_queue_size`              | 256      | power-of-two                       |
+//! | `incoming_queue_size`              | 256      | power-of-two                       |
+//! | `ack_buffer_size`                  | 256      | `>= 32`                            |
+//! | `rtt_smoothing_factor`             | 0.0025   | `[0.0, 1.0]`                       |
+//! | `packet_loss_smoothing_factor`     | 0.1      | `[0.0, 1.0]`                       |
+//! | `bandwidth_smoothing_factor`       | 0.1      | `[0.0, 1.0]`                       |
+//! | `packet_header_size`               | 28       | informational only                 |
 
 /// Configuration for a reliable UDP endpoint.
 ///
 /// Create with [`EndpointConfig::default`] or [`EndpointConfig::with_name`],
-/// then call [`EndpointConfig::validate`] before passing to [`Endpoint::new`]
-/// if you have changed any fields.
+/// then optionally adjust fields. Pass to [`Endpoint::new`], which calls
+/// [`EndpointConfig::validate`] automatically and panics with a descriptive
+/// message if any constraint is violated.
 #[derive(Debug, Clone)]
 pub struct EndpointConfig {
     /// Human-readable label used in log messages (debugging only, not on wire).
@@ -66,10 +81,14 @@ pub struct EndpointConfig {
     /// The actual UDP datagram will be larger by the combined header sizes.
     pub fragment_size: usize,
 
-    /// Capacity of the ACK sequence ring buffer (power-of-two).
+    /// Capacity of the ACK notification buffer.
     ///
-    /// Not directly a ring buffer size, but used indirectly when generating
-    /// the 32-bit ACK bitfield window.
+    /// Determines how many acknowledged sequence numbers [`Endpoint::get_acks`]
+    /// can return per tick. Each call to [`Endpoint::process_acks`] (internal)
+    /// can add up to 32 entries (one per bit in the ACK bitfield). Call
+    /// [`Endpoint::clear_acks`] once per tick to prevent overflow.
+    ///
+    /// Must be > 0. Should be >= 32 to hold at least one full ACK batch.
     pub ack_buffer_size: usize,
 
     /// Number of slots in the sent-packet ring buffer (power-of-two).
@@ -165,15 +184,22 @@ impl EndpointConfig {
 
     /// Validate the configuration and return a descriptive error if it is invalid.
     ///
+    /// [`Endpoint::new`] calls this automatically. Call it explicitly only when
+    /// you want to surface errors without panicking (e.g., when loading config
+    /// from user input).
+    ///
     /// Checks performed:
     /// - `max_packet_size > 0`
     /// - `fragment_size > 0`
     /// - `max_fragments > 0`
     /// - `fragment_above <= max_packet_size`
     /// - `max_packet_size <= max_fragments * fragment_size`
-    /// - `sent_packets_buffer_size` is a positive power of two
+    /// - `sent_packets_buffer_size` is a positive power of two and `>= 32`
+    /// - `ack_buffer_size >= 32`
     /// - `received_packets_buffer_size` is a positive power of two
     /// - `fragment_reassembly_buffer_size` is a positive power of two
+    /// - `outgoing_queue_size` is a positive power of two
+    /// - `incoming_queue_size` is a positive power of two
     /// - all smoothing factors are in `[0.0, 1.0]`
     pub fn validate(&self) -> Result<(), String> {
         if self.max_packet_size == 0 {
@@ -202,6 +228,23 @@ impl EndpointConfig {
 
         if self.sent_packets_buffer_size == 0 || !self.sent_packets_buffer_size.is_power_of_two() {
             return Err("sent_packets_buffer_size must be a power of two".to_string());
+        }
+
+        if self.sent_packets_buffer_size < 32 {
+            return Err(
+                "sent_packets_buffer_size must be >= 32 (one full ACK batch per receive)"
+                    .to_string(),
+            );
+        }
+
+        if self.ack_buffer_size == 0 {
+            return Err("ack_buffer_size must be > 0".to_string());
+        }
+
+        if self.ack_buffer_size < 32 {
+            return Err(
+                "ack_buffer_size must be >= 32 (one full ACK batch = 32 entries)".to_string(),
+            );
         }
 
         if self.received_packets_buffer_size == 0
