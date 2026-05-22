@@ -1,9 +1,55 @@
-//! Packet header serialization and deserialization
+//! Packet header wire format - variable-length encoding for low-overhead ACK delivery.
+//!
+//! Every UDP datagram sent by this library starts with a [`PacketHeader`] (regular
+//! packets) or a [`FragmentHeader`](crate::fragment::FragmentHeader) (fragmented
+//! packets). Bit 0 of the first byte is the fragment flag; `0` means regular,
+//! `1` means fragment.
+//!
+//! ## Regular Packet Wire Format
+//!
+//! ```text
+//! Byte 0   : prefix byte
+//!            bit 0     : 0 (regular packet marker)
+//!            bit 1     : ack_bits byte 0 present (byte is NOT 0xFF)
+//!            bit 2     : ack_bits byte 1 present
+//!            bit 3     : ack_bits byte 2 present
+//!            bit 4     : ack_bits byte 3 present
+//!            bit 5     : 1 = ack stored as 1-byte diff from sequence
+//!                        0 = ack stored as full 2-byte LE u16
+//! Bytes 1-2: sequence (LE u16, always present)
+//! Byte  3  : ack_diff (u8, when bit 5 set)  OR
+//! Bytes 3-4: ack      (LE u16, when bit 5 clear)
+//! Bytes n..: ack_bits bytes that are NOT 0xFF (0-4 bytes)
+//! ```
+//!
+//! ### Size range
+//!
+//! | Scenario                               | Bytes |
+//! |----------------------------------------|-------|
+//! | All ack_bits 0xFF, ack_diff fits 1 byte| 4     |
+//! | All ack_bits 0xFF, ack full 2 bytes    | 5     |
+//! | All ack_bits present, ack_diff 1 byte  | 8     |
+//! | Worst case (all ack_bits, full ack)    | 9     |
+//!
+//! Bytes that are `0xFF` in `ack_bits` are omitted because `0xFF` is the
+//! default ("all received") value; the decoder initialises `ack_bits` to
+//! `0xFFFFFFFF` and only patches bytes that are explicitly sent.
+//!
+//! ## Encoding Invariants
+//!
+//! - All multi-byte integers are **little-endian** (`to_le_bytes` / `from_le_bytes`).
+//! - `sequence` is always encoded as a full 2-byte LE u16.
+//! - `ack` is encoded as a 1-byte difference `sequence - ack` when that
+//!   difference fits in a `u8` (saves 1 byte in the common case).
+//! - No pointer casting, no host-endian assumptions.
 
-/// Maximum size of a packet header in bytes
+/// Maximum size of a packet header in bytes (worst-case: full ack + all four ack_bits bytes).
 pub const MAX_PACKET_HEADER_BYTES: usize = 9;
 
-/// Packet header structure
+/// Packet header - carries sequence number, ACK number, and ACK bitfield.
+///
+/// Encoded on the wire as a variable-length structure; see the
+/// [module-level documentation](self) for the byte layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PacketHeader {
     /// Sequence number of this packet
@@ -235,17 +281,20 @@ impl PacketHeader {
             pos += 1;
         }
 
-        Some((Self { sequence, ack, ack_bits }, pos))
+        Some((
+            Self {
+                sequence,
+                ack,
+                ack_bits,
+            },
+            pos,
+        ))
     }
 
     /// Calculate sequence difference for encoding
     fn sequence_diff(&self) -> i32 {
         let diff = self.sequence.wrapping_sub(self.ack) as i32;
-        if diff < 0 {
-            diff + 65536
-        } else {
-            diff
-        }
+        if diff < 0 { diff + 65536 } else { diff }
     }
 }
 

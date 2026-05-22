@@ -1,9 +1,39 @@
-//! Utility functions for sequence number handling
+//! Sequence number helpers and general numeric utilities.
+//!
+//! ## Half-Range Comparison
+//!
+//! UDP sequence numbers are 16-bit unsigned integers that wrap around at
+//! 65535 -> 0. A naive `a > b` comparison breaks at the wrap point. The
+//! standard fix is the *half-range* rule:
+//!
+//! ```text
+//! s1 is "greater than" s2 when:
+//!   ( s1 > s2  AND  s1 - s2 <= 32768 )  -- s1 is ahead, no wrap
+//!   OR
+//!   ( s1 < s2  AND  s2 - s1 > 32768  )  -- s1 wrapped past s2
+//! ```
+//!
+//! This correctly handles all wrap-around cases as long as the two sequences
+//! are never more than 32767 apart. The library enforces this by keeping
+//! buffer sizes well within that bound.
+//!
+//! All arithmetic on sequence numbers uses `wrapping_add` / `wrapping_sub`
+//! to stay correct at the wrap boundary. Direct `a > b` or `a - b` on
+//! raw sequence values is forbidden on the hot path.
+//!
+//! ## Exponential Moving Average
+//!
+//! [`smooth_value`] implements a simple EMA:
+//!
+//! ```text
+//! new_estimate = current + (sample - current) * factor
+//! ```
+//!
+//! Used for RTT, packet loss, and bandwidth smoothing. If the sample and
+//! current value are within 0.00001 the sample is returned directly to
+//! avoid floating-point drift accumulation.
 
 /// Check if sequence s1 is greater than s2, handling wrap-around
-///
-/// Uses the algorithm: s1 > s2 if (s1 > s2 && s1 - s2 <= 32768) ||
-/// (s1 < s2 && s2 - s1 > 32768)
 ///
 /// # Examples
 ///
@@ -16,8 +46,7 @@
 /// ```
 #[inline]
 pub fn sequence_greater_than(s1: u16, s2: u16) -> bool {
-    ((s1 > s2) && (s1.wrapping_sub(s2) <= 32768))
-        || ((s1 < s2) && (s2.wrapping_sub(s1) > 32768))
+    ((s1 > s2) && (s1.wrapping_sub(s2) <= 32768)) || ((s1 < s2) && (s2.wrapping_sub(s1) > 32768))
 }
 
 /// Check if sequence s1 is less than s2, handling wrap-around

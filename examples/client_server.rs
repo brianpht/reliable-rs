@@ -1,7 +1,7 @@
 //! Client-server example with proper message handling
 
-use std::collections::HashMap;
 use reliable_rs::{Endpoint, EndpointConfig};
+use std::collections::HashMap;
 
 /// Simple message that can be sent/received
 #[derive(Debug)]

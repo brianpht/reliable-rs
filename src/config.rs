@@ -1,45 +1,108 @@
-//! Endpoint configuration
+//! Endpoint configuration - preallocated capacities and protocol tuning knobs.
+//!
+//! [`EndpointConfig`] is built once at startup and handed to [`Endpoint::new`].
+//! All buffer sizes are fixed at that point; the library never reallocates
+//! during steady-state operation.
+//!
+//! ## Power-of-Two Requirement
+//!
+//! `sent_packets_buffer_size`, `received_packets_buffer_size`, and
+//! `fragment_reassembly_buffer_size` **must** be powers of two. The ring-buffer
+//! index is computed as `seq & (capacity - 1)`, which is only correct when
+//! capacity is a power of two. [`EndpointConfig::validate`] enforces this and
+//! returns an `Err` if any constraint is violated.
+//!
+//! ## Defaults
+//!
+//! [`EndpointConfig::default`] provides values suitable for a 1 Mbps game
+//! connection with packets up to 16 KB:
+//!
+//! | Field                            | Default  |
+//! |----------------------------------|----------|
+//! | `max_packet_size`                | 16384    |
+//! | `fragment_above`                 | 1024     |
+//! | `fragment_size`                  | 1024     |
+//! | `max_fragments`                  | 16       |
+//! | `sent_packets_buffer_size`       | 256      |
+//! | `received_packets_buffer_size`   | 256      |
+//! | `fragment_reassembly_buffer_size`| 64       |
+//! | `rtt_smoothing_factor`           | 0.0025   |
+//! | `packet_loss_smoothing_factor`   | 0.1      |
+//! | `bandwidth_smoothing_factor`     | 0.1      |
+//! | `packet_header_size`             | 28       |
 
-/// Configuration for an endpoint
+/// Configuration for a reliable UDP endpoint.
+///
+/// Create with [`EndpointConfig::default`] or [`EndpointConfig::with_name`],
+/// then call [`EndpointConfig::validate`] before passing to [`Endpoint::new`]
+/// if you have changed any fields.
 #[derive(Debug, Clone)]
 pub struct EndpointConfig {
-    /// Name of the endpoint (for debugging)
+    /// Human-readable label used in log messages (debugging only, not on wire).
     pub name: String,
 
-    /// Maximum packet size in bytes
+    /// Maximum payload size in bytes that [`Endpoint::send_packet`] will accept.
+    ///
+    /// Packets larger than this are rejected with a counter increment. Must
+    /// satisfy `max_packet_size <= max_fragments * fragment_size`.
     pub max_packet_size: usize,
 
-    /// Packets larger than this will be fragmented
+    /// Payload size threshold above which a packet is split into fragments.
+    ///
+    /// Packets at or below this size are sent as a single datagram. Must be
+    /// `<= max_packet_size`.
     pub fragment_above: usize,
 
-    /// Maximum number of fragments per packet
+    /// Maximum number of fragments a single logical packet may produce.
+    ///
+    /// Also caps `num_fragments` in [`FragmentHeader`] to 255.
     pub max_fragments: usize,
 
-    /// Size of each fragment in bytes
+    /// Size of each fragment payload in bytes.
+    ///
+    /// The actual UDP datagram will be larger by the combined header sizes.
     pub fragment_size: usize,
 
-    /// Size of the ACK buffer
+    /// Capacity of the ACK sequence ring buffer (power-of-two).
+    ///
+    /// Not directly a ring buffer size, but used indirectly when generating
+    /// the 32-bit ACK bitfield window.
     pub ack_buffer_size: usize,
 
-    /// Size of the sent packets buffer
+    /// Number of slots in the sent-packet ring buffer (power-of-two).
+    ///
+    /// Larger values extend the loss-detection window at the cost of memory.
     pub sent_packets_buffer_size: usize,
 
-    /// Size of the received packets buffer
+    /// Number of slots in the received-packet ring buffer (power-of-two).
+    ///
+    /// Controls how far back duplicate detection reaches.
     pub received_packets_buffer_size: usize,
 
-    /// Size of the fragment reassembly buffer
+    /// Number of slots in the fragment reassembly ring buffer (power-of-two).
+    ///
+    /// Each slot can hold one in-flight fragmented packet. Increase this if
+    /// many large packets may be in flight simultaneously.
     pub fragment_reassembly_buffer_size: usize,
 
-    /// RTT smoothing factor (0.0 - 1.0)
+    /// Exponential moving average factor for RTT (range: 0.0-1.0).
+    ///
+    /// Lower values produce a smoother estimate that reacts more slowly.
+    /// Default 0.0025 is appropriate for 60 Hz tick rates.
     pub rtt_smoothing_factor: f32,
 
-    /// Packet loss smoothing factor (0.0 - 1.0)
+    /// Exponential moving average factor for packet loss (range: 0.0-1.0).
+    ///
+    /// Computed over a window of `sent_packets_buffer_size / 2` samples.
     pub packet_loss_smoothing_factor: f32,
 
-    /// Bandwidth smoothing factor (0.0 - 1.0)
+    /// Exponential moving average factor for bandwidth estimates (range: 0.0-1.0).
     pub bandwidth_smoothing_factor: f32,
 
-    /// Size of packet header (IP + UDP headers)
+    /// Combined IP + UDP header size assumed when computing bandwidth figures.
+    ///
+    /// Default 28 = 20 bytes IPv4 + 8 bytes UDP. Adjust for IPv6 (48) or
+    /// tunnelled transports.
     pub packet_header_size: usize,
 }
 
@@ -64,7 +127,7 @@ impl Default for EndpointConfig {
 }
 
 impl EndpointConfig {
-    /// Create a new configuration with the given name
+    /// Create a configuration with a custom name and all other fields at their defaults.
     pub fn with_name(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -72,7 +135,18 @@ impl EndpointConfig {
         }
     }
 
-    /// Validate the configuration
+    /// Validate the configuration and return a descriptive error if it is invalid.
+    ///
+    /// Checks performed:
+    /// - `max_packet_size > 0`
+    /// - `fragment_size > 0`
+    /// - `max_fragments > 0`
+    /// - `fragment_above <= max_packet_size`
+    /// - `max_packet_size <= max_fragments * fragment_size`
+    /// - `sent_packets_buffer_size` is a positive power of two
+    /// - `received_packets_buffer_size` is a positive power of two
+    /// - `fragment_reassembly_buffer_size` is a positive power of two
+    /// - all smoothing factors are in `[0.0, 1.0]`
     pub fn validate(&self) -> Result<(), String> {
         if self.max_packet_size == 0 {
             return Err("max_packet_size must be > 0".to_string());
@@ -102,11 +176,15 @@ impl EndpointConfig {
             return Err("sent_packets_buffer_size must be a power of two".to_string());
         }
 
-        if self.received_packets_buffer_size == 0 || !self.received_packets_buffer_size.is_power_of_two() {
+        if self.received_packets_buffer_size == 0
+            || !self.received_packets_buffer_size.is_power_of_two()
+        {
             return Err("received_packets_buffer_size must be a power of two".to_string());
         }
 
-        if self.fragment_reassembly_buffer_size == 0 || !self.fragment_reassembly_buffer_size.is_power_of_two() {
+        if self.fragment_reassembly_buffer_size == 0
+            || !self.fragment_reassembly_buffer_size.is_power_of_two()
+        {
             return Err("fragment_reassembly_buffer_size must be a power of two".to_string());
         }
 

@@ -1,33 +1,75 @@
 //! # reliable-rs
 //!
-//! A pure Rust implementation of reliable UDP protocol for real-time
-//! games and applications.
+//! A deterministic, allocation-free, lock-free reliable UDP transport core for
+//! real-time games and applications.
 //!
-//! ## Overview
+//! ## Design Goals
 //!
-//! This library provides:
-//! - Packet acknowledgment with selective ACKs
-//! - Automatic packet fragmentation and reassembly
-//! - RTT and packet loss estimation
-//! - Bandwidth tracking
+//! - **Deterministic** - no unbounded memory growth, no nondeterministic latency
+//! - **Allocation-free hot path** - zero heap allocations during steady-state send/receive
+//! - **Lock-free** - single-writer model, no mutex contention on the hot path
+//! - **Cache-local** - power-of-two ring buffers with bitwise indexing, hot fields first
 //!
-//! ## Example
+//! ## Architecture
+//!
+//! ```text
+//! +--------+   send_packet   +----------+   take_outgoing_packets   +--------+
+//! |        | --------------> |          | -------------------------> |        |
+//! |  App   |                 | Endpoint |                            |  UDP   |
+//! |        | <-------------- |          | <------------------------- |  Net   |
+//! +--------+  take_incoming  +----+-----+   receive_packet           +--------+
+//!                                 |
+//!                    +------------+-----------+
+//!                    |            |           |
+//!             SequenceBuffer  Fragment    PacketHeader
+//!             (sent/recv)    Reassembly   encode/decode
+//! ```
+//!
+//! ## Modules
+//!
+//! | Module           | Responsibility                                              |
+//! |------------------|-------------------------------------------------------------|
+//! | `config`         | Endpoint tuning knobs and preallocated buffer capacities    |
+//! | `endpoint`       | Send/receive logic, ACK processing, RTT/loss estimation     |
+//! | `fragment`       | Packet fragmentation and reassembly                         |
+//! | `packet`         | Wire format: variable-length header encode/decode           |
+//! | `sequence_buffer`| Power-of-two ring buffer for sent/received packet tracking  |
+//! | `utils`          | Sequence number wrapping arithmetic helpers                 |
+//!
+//! ## Quick Start
 //!
 //! ```rust
 //! use reliable_rs::{Endpoint, EndpointConfig};
 //!
-//! let config = EndpointConfig::default();
-//! let mut endpoint = Endpoint::new(config, 0.0);
+//! let mut client = Endpoint::new(EndpointConfig::default(), 0.0);
+//! let mut server = Endpoint::new(EndpointConfig::default(), 0.0);
 //!
-//! // Send a packet
-//! endpoint.send_packet(b"Hello!");
+//! // Client queues a packet for transmission
+//! client.send_packet(b"Hello, Server!");
 //!
-//! // Get packets to transmit
-//! let outgoing = endpoint.take_outgoing_packets();
+//! // Hand outgoing wire bytes to the UDP layer
+//! let outgoing = client.take_outgoing_packets();
+//! for (_, bytes) in &outgoing {
+//!     server.receive_packet(bytes);
+//! }
+//!
+//! // Read the reassembled payload
+//! let received = server.take_incoming_packets();
+//! assert_eq!(&received[0].1, b"Hello, Server!");
+//!
+//! // Server response carries a piggy-backed ACK for the client's packet
+//! server.send_packet(b"Hello, Client!");
+//! let response = server.take_outgoing_packets();
+//! client.receive_packet(&response[0].1);
+//!
+//! // Client now knows its packet was acknowledged
+//! let acks = client.get_acks();
+//! assert!(acks.contains(&0)); // sequence 0 was acked
+//! client.clear_acks();
 //! ```
 
-# ![warn(missing_docs)]
-# ![warn(clippy::all)]
+#![warn(missing_docs)]
+#![warn(clippy::all)]
 
 mod config;
 mod endpoint;
@@ -38,44 +80,48 @@ mod utils;
 
 pub use config::EndpointConfig;
 pub use endpoint::{Endpoint, EndpointCounters};
-pub use packet::{PacketHeader, MAX_PACKET_HEADER_BYTES};
+pub use packet::{MAX_PACKET_HEADER_BYTES, PacketHeader};
 pub use utils::{sequence_greater_than, sequence_less_than};
 
-/// Fragment header size in bytes
+/// Fragment header size in bytes (prefix + sequence + fragment_id + num_fragments).
 pub const FRAGMENT_HEADER_BYTES: usize = fragment::FRAGMENT_HEADER_BYTES;
 
-/// Error types for the library
+/// Error types returned by the library.
+///
+/// All variants map to specific protocol or validation failures. The
+/// `FragmentError` and `PacketTooLarge` variants carry human-readable context
+/// strings; these allocate only on the error path, never on the hot path.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// Packet exceeds maximum allowed size
+    /// Packet exceeds [`EndpointConfig::max_packet_size`].
     #[error("Packet too large: {size} bytes (max: {max})")]
     PacketTooLarge {
-        /// Actual packet size
+        /// Actual packet size in bytes.
         size: usize,
-        /// Maximum allowed size
+        /// Configured maximum in bytes.
         max: usize,
     },
 
-    /// Invalid packet header
+    /// Packet header could not be decoded (truncated or has wrong flags).
     #[error("Invalid packet header")]
     InvalidHeader,
 
-    /// Fragment reassembly failed
+    /// Fragment reassembly could not complete.
     #[error("Fragment reassembly failed: {reason}")]
     FragmentError {
-        /// Reason for failure
+        /// Human-readable description of why reassembly failed.
         reason: String,
     },
 
-    /// Packet sequence is stale
+    /// Received sequence number is too old to fit in the receive window.
     #[error("Stale packet sequence: {sequence}")]
     StalePacket {
-        /// The stale sequence number
+        /// The rejected sequence number.
         sequence: u16,
     },
 }
 
-/// Result type for the library
+/// Convenience `Result` alias using this crate's [`Error`] type.
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(test)]

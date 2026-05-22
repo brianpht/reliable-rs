@@ -1,8 +1,8 @@
 //! Throughput benchmarks for reliable-rs
 
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-use std::hint::black_box;
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use reliable_rs::{Endpoint, EndpointConfig};
+use std::hint::black_box;
 
 fn benchmark_send_receive(c: &mut Criterion) {
     let mut group = c.benchmark_group("send_receive");
@@ -82,9 +82,7 @@ fn benchmark_packet_header(c: &mut Criterion) {
         let mut buffer = Vec::new();
         header.write(&mut buffer);
 
-        b.iter(|| {
-            black_box(PacketHeader::read(black_box(&buffer)))
-        });
+        b.iter(|| black_box(PacketHeader::read(black_box(&buffer))));
     });
 
     group.finish();

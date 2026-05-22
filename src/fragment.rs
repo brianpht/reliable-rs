@@ -1,4 +1,47 @@
-//! Packet fragmentation and reassembly
+//! Packet fragmentation and reassembly.
+//!
+//! Large packets that exceed [`EndpointConfig::fragment_above`] are split into
+//! multiple UDP datagrams called fragments. Each fragment carries a
+//! [`FragmentHeader`] so the receiver can detect fragmented traffic and
+//! accumulate pieces until the full logical packet is available.
+//!
+//! ## Wire Layout
+//!
+//! ### Fragment datagram (all fragments)
+//!
+//! ```text
+//! +--------------------+
+//! | FragmentHeader (5) |  -- prefix byte(0x01), seq(LE u16), id, count
+//! +--------------------+
+//! | PacketHeader (var) |  -- present ONLY in fragment 0 (carries ACK info)
+//! +--------------------+
+//! | Fragment payload   |
+//! +--------------------+
+//! ```
+//!
+//! The first byte's LSB being `1` distinguishes fragment datagrams from regular
+//! packet datagrams (where bit 0 is always `0` in the prefix byte).
+//!
+//! ### FragmentHeader encoding (5 bytes, little-endian)
+//!
+//! ```text
+//! Byte 0: 0x01       (fragment flag)
+//! Byte 1: seq[0]     (sequence low byte, LE)
+//! Byte 2: seq[1]     (sequence high byte, LE)
+//! Byte 3: fragment_id      (0 .. num_fragments-1)
+//! Byte 4: num_fragments    (1 .. 255)
+//! ```
+//!
+//! ## Reassembly
+//!
+//! Fragments are held in a [`FragmentReassemblyBuffer`] - a power-of-two ring
+//! buffer indexed by `sequence & (capacity - 1)`. When the last fragment for a
+//! sequence arrives, the entry is removed from the buffer and the fragments are
+//! concatenated in order to produce the original payload.
+//!
+//! Duplicate fragments are silently dropped (detected via a `[u32; 8]` bit
+//! mask - one bit per fragment ID, supporting up to 256 fragments).
+//! Out-of-order arrival is handled transparently.
 
 use crate::sequence_buffer::SequenceBuffer;
 
@@ -93,7 +136,6 @@ pub(crate) struct ReassemblyData {
     pub fragments: Vec<Vec<u8>>,
 }
 
-
 impl ReassemblyData {
     /// Check if a fragment has been received
     pub fn has_fragment(&self, fragment_id: u8) -> bool {
@@ -171,9 +213,7 @@ impl FragmentReassemblyBuffer {
         // Get or create reassembly entry
         let is_new = !self.buffer.exists(header.sequence);
 
-        if is_new
-            && self.buffer.insert(header.sequence).is_none()
-        {
+        if is_new && self.buffer.insert(header.sequence).is_none() {
             log::warn!("Failed to insert reassembly entry");
             return None;
         }

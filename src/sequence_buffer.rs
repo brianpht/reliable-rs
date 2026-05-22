@@ -1,4 +1,41 @@
-//! Sequence buffer implementation for tracking sent and received packets
+//! Power-of-two ring buffer indexed by 16-bit sequence numbers.
+//!
+//! [`SequenceBuffer<T>`] is the core data structure used for tracking both
+//! sent packets (for ACK processing and loss detection) and received packets
+//! (for duplicate filtering and ACK generation).
+//!
+//! ## Index Calculation
+//!
+//! The slot for sequence `s` in a buffer of capacity `N` is:
+//!
+//! ```text
+//! index = s & (N - 1)
+//! ```
+//!
+//! This is O(1) and branch-free. It requires `N` to be a power of two;
+//! [`SequenceBuffer::new`] panics otherwise.
+//!
+//! ## Sequence Ordering
+//!
+//! Sequence numbers are 16-bit unsigned integers that wrap at 65535 -> 0.
+//! All comparisons use half-range arithmetic (see [`crate::utils`]):
+//!
+//! - `sequence_less_than(a, b)` is true when `b - a` (mod 65536) < 32768
+//! - Stale entries are those whose sequence falls more than `N` steps behind
+//!   the current head
+//!
+//! ## Eviction Policy
+//!
+//! When `insert(s)` is called with a sequence number ahead of the current
+//! head, all slots between the old head and `s` are cleared before writing.
+//! This guarantees that no slot holds data from a previous cycle that could
+//! be confused with the new entry.
+//!
+//! ## ACK Generation
+//!
+//! [`SequenceBuffer::generate_ack_bits`] walks the 32 slots before head and
+//! produces the `(ack, ack_bits)` pair: `ack` is `head - 1`, and bit `i` of
+//! `ack_bits` is set when sequence `ack - i` has an entry in the buffer.
 
 use crate::utils::sequence_less_than;
 
@@ -24,11 +61,14 @@ pub(crate) struct SequenceBuffer<T: Clone + Default> {
 
 impl<T: Clone + Default> SequenceBuffer<T> {
     /// Create a new sequence buffer with the given size
-    /// 
+    ///
     /// # Panics
     /// Panics if size is not a power of two (required for O(1) bitwise indexing)
     pub fn new(size: usize) -> Self {
-        assert!(size > 0 && size.is_power_of_two(), "SequenceBuffer size must be a power of two");
+        assert!(
+            size > 0 && size.is_power_of_two(),
+            "SequenceBuffer size must be a power of two"
+        );
         Self {
             sequence: 0,
             entries: vec![None; size],

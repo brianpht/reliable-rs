@@ -1,12 +1,56 @@
-//! Endpoint implementation
+//! Reliable UDP endpoint - the central object for sending and receiving packets.
+//!
+//! ## Lifecycle
+//!
+//! ```text
+//! Endpoint::new(config, t0)
+//!     |
+//!     +-- send_packet(payload)        // queue one logical packet
+//!     |       |-- fragment if payload > config.fragment_above
+//!     |       +-- push to outgoing_packets
+//!     |
+//!     +-- take_outgoing_packets()     // drain and hand to UDP layer
+//!     |
+//!     +-- receive_packet(wire_bytes)  // feed a single UDP datagram
+//!     |       |-- regular: decode PacketHeader, track recv, process ACKs
+//!     |       +-- fragment: decode FragmentHeader, reassemble, track recv
+//!     |
+//!     +-- take_incoming_packets()     // drain reassembled payloads
+//!     |
+//!     +-- update(current_time)        // call once per tick to update stats
+//!     |       |-- update_packet_loss()
+//!     |       +-- update_bandwidth()
+//!     |
+//!     +-- get_acks() / clear_acks()   // inspect acknowledged sequences
+//! ```
+//!
+//! ## ACK Mechanism
+//!
+//! Every outgoing datagram carries:
+//! - `ack` - the highest received sequence number seen so far
+//! - `ack_bits` - a 32-bit sliding window; bit `i` set means sequence `ack - i` was also received
+//!
+//! The receiver calls [`process_acks`](Endpoint) internally on each
+//! incoming datagram. When a sent-packet entry is found unacked, it is
+//! marked acked, pushed to the acks list, and its RTT sample is folded
+//! into the EMA estimate.
+//!
+//! ## Statistics
+//!
+//! All statistics are updated lazily in [`Endpoint::update`]:
+//! - **RTT** - EMA over round-trip samples derived from ACK timestamps
+//! - **Packet loss** - fraction of unacked entries in the older half of the
+//!   sent-packet ring buffer (smoothed EMA)
+//! - **Bandwidth** - sent / received / acked kbps computed from ring-buffer
+//!   timestamps and byte counts (smoothed EMA)
 
 use std::collections::VecDeque;
 
 use crate::config::EndpointConfig;
 use crate::fragment::{
-    fragment_packet, FragmentHeader, FragmentReassemblyBuffer, FRAGMENT_HEADER_BYTES,
+    FRAGMENT_HEADER_BYTES, FragmentHeader, FragmentReassemblyBuffer, fragment_packet,
 };
-use crate::packet::{is_fragment_packet, PacketHeader, MAX_PACKET_HEADER_BYTES};
+use crate::packet::{MAX_PACKET_HEADER_BYTES, PacketHeader, is_fragment_packet};
 use crate::sequence_buffer::SequenceBuffer;
 use crate::utils::smooth_value;
 
@@ -354,11 +398,8 @@ impl Endpoint {
                     if self.rtt == 0.0 {
                         self.rtt = rtt_sample;
                     } else {
-                        self.rtt = smooth_value(
-                            self.rtt,
-                            rtt_sample,
-                            self.config.rtt_smoothing_factor,
-                        );
+                        self.rtt =
+                            smooth_value(self.rtt, rtt_sample, self.config.rtt_smoothing_factor);
                     }
                 }
             }
