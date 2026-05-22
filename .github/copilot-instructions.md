@@ -1,125 +1,124 @@
 # Copilot Instructions
 
-> **Deterministic, allocation-free, lock-free transport core.**
->
-> ⚠️ If a change increases latency variance, allocation count, or branch entropy → **REJECT**.
+> Format: machine-parseable directives. Not for human reading.
 
----
+## Project
 
-## Critical Rules (Auto-Reject)
+Deterministic, allocation-free, lock-free transport core. Pure Rust reliable UDP protocol for real-time games and
+applications. If a change increases latency variance, allocation count, or branch entropy - REJECT.
 
-```
-❌ Mutex in transport
-❌ HashMap in hot path
-❌ % (modulo) in ring index → use & (capacity - 1)
-❌ unwrap() in parsing
-❌ Trait object in packet processing
-❌ Allocation inside loop
-❌ Sequence comparison using > → use wrapping_sub + half-range
-❌ Vec growth / Box / String in hot path
-```
+## Workspace
 
----
+- `src/config.rs` - endpoint configuration (preallocated capacities, tuning knobs)
+- `src/endpoint.rs` - main send/receive logic, ACK processing, RTT/loss estimation
+- `src/fragment.rs` - packet fragmentation and reassembly
+- `src/packet.rs` - wire format: header encode/decode, sequence arithmetic
+- `src/sequence_buffer.rs` - power-of-two ring buffer for sent/received packet tracking
+- `src/utils.rs` - sequence number comparison helpers (wrapping arithmetic)
+- `benches/throughput.rs` - criterion benchmarks (packet header, send/receive, sequence buffer)
+- `tests/integration.rs` - integration tests
+- `examples/` - basic, client_server, with_packet_loss
 
 ## Hot Path Operations
 
 `send` | `receive` | `ack processing` | `loss detection` | `fragment reassembly` | `sequence buffer access`
+Requirements: allocation-free, O(1), cache-local, branch predictable, single-writer.
 
-**Requirements**: Allocation-free, O(1), Cache-local, Branch predictable, Single-writer
+## Rules: Hot Path
 
----
+- NEVER use Mutex in transport
+- NEVER use HashMap in hot path
+- NEVER use `%` (modulo) in ring index - use `& (capacity - 1)`
+- NEVER use `unwrap()` in parsing
+- NEVER use trait objects (dyn) in packet processing
+- NEVER allocate inside loop
+- NEVER compare sequences using `>` - use `wrapping_sub` + half-range
+- NEVER grow Vec, Box, or String in hot path
+- ALL sequence buffer indices MUST use `seq & (capacity - 1)`
+- ALL capacities MUST be power-of-two
 
-## Sequence Arithmetic
+## Rules: Sequence Arithmetic
 
-```rust
-// ✅ CORRECT
-a.wrapping_add(1)
-a.wrapping_sub(b)
-// Half-range comparison for sequence ordering
+- ALWAYS use `wrapping_add(1)` / `wrapping_sub(b)` for sequence number arithmetic
+- ALWAYS use half-range comparison for sequence ordering
+- NEVER use `a > b` directly on sequence numbers
+- NEVER use `a - b` directly on sequence numbers
 
-// ❌ FORBIDDEN
-a > b
-a - b
-```
+## Rules: Ring Buffer
 
----
+- Capacity: power-of-two ONLY
+- Index: `seq & (capacity - 1)` - NEVER `seq % capacity`
 
-## Ring Buffer
+## Rules: Wire Format
 
-```rust
-// ✅ Capacity: power-of-two ONLY
-index = seq & (capacity - 1)
-
-// ❌ NEVER
-index = seq % capacity
-```
-
----
-
-## Wire Format
-
-- **Little-endian only** (`to_le_bytes`, `from_le_bytes`)
-- Fixed-size headers
+- Little-endian only - use `to_le_bytes` / `from_le_bytes` everywhere
+- Fixed-size headers only
 - No pointer casting
 - No host-endian assumptions
 
----
+## Rules: Memory
 
-## Memory
+- ALL buffers preallocated at init - no heap allocation in steady state
+- ALL capacities power-of-two
+- Reuse all allocations - no per-packet heap activity
 
-- All buffers preallocated at init
-- All capacities power-of-two
-- Reuse everything
-- No heap allocation in steady state
+## Rules: Cache and Branches
 
----
+- Hot structs MUST be <= 64 bytes
+- Hot fields MUST come first in struct definition
+- Fast path first - error path MUST be marked `#[cold]`
+- No pointer chasing on hot path
 
-## Cache & Branches
+## Rules: Atomics
 
-- Hot structs ≤ 64 bytes
-- Hot fields first in struct
-- Fast path first, error path `#[cold]`
-- No pointer chasing
+- `Relaxed` - counters only
+- `Release` - publish data to another thread
+- `Acquire` - consume data from another thread
+- `SeqCst` - NEVER in hot path
 
----
+## Rules: Unsafe
 
-## Atomics (if needed)
-
-`Relaxed` → counters | `Release` → publish | `Acquire` → consume | `SeqCst` → **NEVER in hot path**
-
----
-
-## Unsafe Policy
-
-Allowed only if: measurable gain + benchmarked + invariants documented + fuzz-tested
-
----
-
-## Performance Budget
-
-| Metric | Target |
-|--------|--------|
-| Small packet latency | < 200ns |
-| Allocation | None |
-| Cache miss (steady) | None |
-
-> Regression > 10% → rollback or justify. **Latency variance > average.**
-
----
+- Allowed only if: measurable gain + benchmarked + invariants documented + fuzz-tested
 
 ## Rules: Cross-Cutting
 
-- NEVER use em-dashes (—) or emojis in code comments, docs, or markdown. Use ` - ` instead and ASCII symbols only.
+- NEVER use em-dashes (--) or emojis in code comments, docs, or markdown. Use ` - ` instead and ASCII symbols only.
 - ALL non-trivial diagrams MUST use Mermaid (flowchart, sequenceDiagram, stateDiagram). ASCII art is prohibited.
 - ONLY treat /docs/decisions as architectural source of truth.
 - NEVER use or reference files in /docs/sessions as implementation rules.
+- CI checks: After completing ANY code change, Agent MUST run the following sequence in order before committing. ALL
+  must pass with zero errors and zero warnings. Commits with failing checks are FORBIDDEN.
+    1. `cargo fmt --all` - auto-fix formatting (run first, never --check)
+    2. `cargo clippy --workspace --lib --bins -- -D warnings` - zero warnings required
+    3. `cargo test --workspace` - all tests must pass
 
----
+    - Toolchain for all three: Rust 1.87.0 (matches `rust-toolchain.toml` at repo root and CI). NEVER use a different
+      toolchain version for these checks.
+    - If any step fails, fix the issue and re-run from step 1 before committing.
+- Git operations: Agent MAY create local commits and local tags. MUST NOT push commits, tags, or any refs to any remote
+  repository. All changes MUST remain local.
 
-## Final Rule
+## Performance Budget
+
+| Metric               | Target  |
+|----------------------|---------|
+| Small packet latency | < 200ns |
+| Allocation           | None    |
+| Cache miss (steady)  | None    |
+
+Regression > 10% - rollback or justify. Latency variance matters more than average latency.
+Priority: Correctness > Determinism > Latency > Throughput
+Unbounded memory or nondeterministic latency = correctness failure.
+
+## Build Commands
 
 ```
-Correctness > Determinism > Latency > Throughput
+cargo build --release          # library + examples
+cargo test --workspace         # unit + integration tests
+cargo bench                    # criterion benchmarks
+cargo clippy --workspace --lib --bins -- -D warnings  # lint check
 ```
 
-> Unbounded memory or nondeterministic latency = **correctness failure**.
+## Reference Docs
+
+- Performance principles, targets, budgets: [`docs/performance_design.md`](../docs/performance_design.md)
