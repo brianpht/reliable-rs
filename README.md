@@ -26,7 +26,7 @@ characteristics of UDP.
 
 ```toml
 [dependencies]
-reliable-rs = "0.1"
+reliable-rs = "0.2"
 ```
 
 ## Quick Start
@@ -40,22 +40,22 @@ let mut server = Endpoint::new(EndpointConfig::default(), 0.0);
 // Client sends a packet
 client.send_packet(b"Hello, Server!");
 
-// Drain outgoing datagrams and hand them to the UDP layer
-let outgoing = client.take_outgoing_packets();
-for (sequence, packet_data) in &outgoing {
+// Drain outgoing datagrams and hand them to the UDP layer (zero-alloc)
+client.drain_outgoing(|sequence, packet_data| {
     // socket.send_to(packet_data, server_addr).unwrap();
     server.receive_packet(packet_data); // simulated here
-}
+});
 
-// Server reads the reassembled payload
-for (sequence, payload) in server.take_incoming_packets() {
+// Server reads the reassembled payload (zero-alloc)
+server.drain_incoming(|sequence, payload| {
     println!("seq={} payload={:?}", sequence, payload);
-}
+});
 
 // Server responds; the response datagram carries a piggy-backed ACK
 server.send_packet(b"Hello, Client!");
-let response = server.take_outgoing_packets();
-client.receive_packet(&response[0].1);
+let mut response_buf: Option<Vec<u8>> = None;
+server.drain_outgoing(|_, bytes| response_buf = Some(bytes.to_vec()));
+client.receive_packet(response_buf.as_deref().unwrap());
 
 // Client checks which of its packets were acknowledged
 for &ack in client.get_acks() {
@@ -67,16 +67,16 @@ client.clear_acks();
 ## How It Works
 
 ```text
-+--------+   send_packet   +----------+   take_outgoing_packets    +--------+
-|        | --------------> |          | -------------------------> |        |
-|  App   |                 | Endpoint |                            |  UDP   |
-|        | <-------------- |          | <------------------------- |  Net   |
-+--------+  take_incoming  +----+-----+   receive_packet           +--------+
-                                |
-                   +------------+-----------+
-                   |            |           |
-            SequenceBuffer  Fragment    PacketHeader
-            (sent/recv)    Reassembly   encode/decode
++--------+   send_packet    +----------+   drain_outgoing(|seq, bytes| ...)     +--------+
+|        | ---------------> |          | -------------------------------------> |        |
+|  App   |                  | Endpoint |                                        |  UDP   |
+|        | <--------------- |          | <------------------------------------- |  Net   |
++--------+  drain_incoming  +----+-----+   receive_packet                       +--------+
+                                 |
+                    +------------+-----------+
+                    |            |           |
+             SequenceBuffer  Fragment    PacketHeader
+             (sent/recv)    Reassembly   encode/decode
 ```
 
 ### ACK Mechanism
@@ -188,15 +188,19 @@ println!(
 
 Benchmarks on a modern x86_64 system (indicative, varies by hardware):
 
-| Operation                              | Time     | Throughput  |
-|----------------------------------------|----------|-------------|
-| 64-byte packet send + receive          | ~79 ns   | ~775 MiB/s  |
-| 512-byte packet send + receive         | ~88 ns   | ~5.4 GiB/s  |
-| 4 KB packet fragmented send + receive  | ~524 ns  | ~7.3 GiB/s  |
-| PacketHeader write                     | ~2.9 ns  | -           |
-| PacketHeader read                      | ~1.3 ns  | -           |
-| SequenceBuffer 100 insert+find ops     | ~4.6 us  | -           |
-| Full ACK roundtrip (32 packets)        | ~2.9 us  | -           |
+| Operation                              | Time     | Throughput   |
+|----------------------------------------|----------|--------------|
+| 64-byte packet send + receive          | ~40 ns   | ~1.5 GiB/s   |
+| 512-byte packet send + receive         | ~54 ns   | ~9.0 GiB/s   |
+| 4 KB packet fragmented send + receive  | ~305 ns  | ~13 GiB/s    |
+| PacketHeader write                     | ~3.1 ns  | -            |
+| PacketHeader read                      | ~1.4 ns  | -            |
+| SequenceBuffer 100 insert+find ops     | ~2.1 us  | -            |
+| Full ACK roundtrip (32 packets)        | ~2.3 us  | -            |
+
+> Measured after v0.2.0 zero-alloc refactor. All heap allocations eliminated
+> from the send/receive hot path. Previous v0.1 baseline: ~79 ns (64B),
+> 7.3 GiB/s (fragmented), ~2.9 us (roundtrip).
 
 ### Performance Design
 
@@ -220,7 +224,7 @@ requirement. Key decisions:
 
 | Metric               | Target    | Status        |
 |----------------------|-----------|---------------|
-| Small packet latency | < 200 ns  | ~79 ns        |
+| Small packet latency | < 200 ns  | ~40 ns        |
 | Steady-state allocs  | Zero      | Zero          |
 | Hot path cache misses| Zero      | Zero          |
 
@@ -240,9 +244,9 @@ let mut endpoint = Endpoint::new(EndpointConfig::default(), 0.0);
 
 // Sending
 endpoint.send_packet(b"game state update");
-for (_, packet_data) in endpoint.take_outgoing_packets() {
-    socket.send_to(&packet_data, "server:9000").unwrap();
-}
+endpoint.drain_outgoing(|_, packet_data| {
+    socket.send_to(packet_data, "server:9000").unwrap();
+});
 
 // Receiving
 let mut buf = [0u8; 2048];

@@ -35,14 +35,18 @@
 //! ## Reassembly
 //!
 //! Fragments are held in a [`FragmentReassemblyBuffer`] - a power-of-two ring
-//! buffer indexed by `sequence & (capacity - 1)`. When the last fragment for a
-//! sequence arrives, the entry is removed from the buffer and the fragments are
-//! concatenated in order to produce the original payload.
+//! indexed by `sequence & (capacity - 1)`. Each [`ReassemblyData`] slot owns
+//! a flat byte slab (`fragment_data: Box<[u8]>`, size = `max_fragments *
+//! fragment_size`) preallocated once at buffer construction. No heap activity
+//! occurs during steady-state fragment receipt or reassembly.
 //!
-//! Duplicate fragments are silently dropped (detected via a `[u32; 8]` bit
-//! mask - one bit per fragment ID, supporting up to 256 fragments).
+//! The [`SequenceBuffer`] is used only for sequence-window bookkeeping
+//! (`SequenceBuffer<()>`); actual payload bytes live in the separate slab.
+//!
+//! Duplicate fragments are silently dropped via a `[u32; 8]` bitmask.
 //! Out-of-order arrival is handled transparently.
 
+use crate::packet_queue::PacketQueue;
 use crate::sequence_buffer::SequenceBuffer;
 
 /// Fragment header size
@@ -80,6 +84,7 @@ impl FragmentHeader {
     }
 
     /// Write fragment header to buffer
+    #[allow(dead_code)]
     #[inline]
     pub fn write(&self, buffer: &mut Vec<u8>) -> usize {
         // Prefix byte with fragment flag set (bit 0 = 1)
@@ -117,81 +122,171 @@ impl FragmentHeader {
     }
 }
 
-/// Data for reassembling a fragmented packet
-#[derive(Clone, Default)]
+/// Per-slot state for reassembling a fragmented packet.
+///
+/// Each `ReassemblyData` owns a flat slab (`fragment_data`) and a length
+/// array (`fragment_lens`) preallocated once when [`FragmentReassemblyBuffer`]
+/// is constructed. Resetting a slot for a new sequence clears metadata fields
+/// only; the preallocated buffers are retained and reused.
 pub(crate) struct ReassemblyData {
-    /// Sequence number
-    pub sequence: u16,
-    /// ACK from first fragment
-    pub ack: u16,
-    /// ACK bits from first fragment
-    pub ack_bits: u32,
-    /// Total number of fragments
-    pub num_fragments: u8,
-    /// Number of fragments received
-    pub num_fragments_received: u8,
-    /// Bitmask of received fragments
-    pub fragment_received: [u32; 8],
-    /// Fragment data storage - each fragment stored separately
-    pub fragments: Vec<Vec<u8>>,
+    /// Sequence number being reassembled.
+    pub(crate) sequence: u16,
+    /// ACK from first fragment header.
+    pub(crate) ack: u16,
+    /// ACK bits from first fragment header.
+    pub(crate) ack_bits: u32,
+    /// Total fragment count declared on the wire.
+    pub(crate) num_fragments: u8,
+    /// Number of fragments received so far.
+    pub(crate) num_fragments_received: u8,
+    /// Bitmask of received fragment IDs.
+    /// Bit `id & 31` of word `id >> 5` is set when fragment `id` arrived.
+    pub(crate) fragment_received: [u32; 8],
+    /// Flat fragment payload slab. Fragment `i` occupies bytes
+    /// `[i * fragment_size .. i * fragment_size + fragment_lens[i]]`.
+    /// Preallocated once; never reallocated.
+    fragment_data: Box<[u8]>,
+    /// Byte length of each stored fragment. Preallocated once.
+    fragment_lens: Box<[u16]>,
+    /// Cached fragment size for offset arithmetic.
+    fragment_size: usize,
 }
 
 impl ReassemblyData {
-    /// Check if a fragment has been received
-    pub fn has_fragment(&self, fragment_id: u8) -> bool {
-        let index = (fragment_id / 32) as usize;
-        let bit = fragment_id % 32;
-        (self.fragment_received[index] & (1 << bit)) != 0
+    /// Allocate a new slot with preallocated slab storage.
+    ///
+    /// Called once per slot in [`FragmentReassemblyBuffer::new`].
+    fn new_preallocated(max_fragments: usize, fragment_size: usize) -> Self {
+        Self {
+            sequence: 0,
+            ack: 0,
+            ack_bits: 0,
+            num_fragments: 0,
+            num_fragments_received: 0,
+            fragment_received: [0u32; 8],
+            fragment_data: vec![0u8; max_fragments * fragment_size].into_boxed_slice(),
+            fragment_lens: vec![0u16; max_fragments].into_boxed_slice(),
+            fragment_size,
+        }
     }
 
-    /// Mark a fragment as received
-    pub fn mark_fragment(&mut self, fragment_id: u8) {
-        let index = (fragment_id / 32) as usize;
-        let bit = fragment_id % 32;
-        self.fragment_received[index] |= 1 << bit;
+    /// Reset this slot for a new sequence number.
+    ///
+    /// Clears all metadata fields. The pre-allocated `fragment_data` and
+    /// `fragment_lens` slabs are retained; only the active length entries
+    /// (0..num_fragments) are zeroed.
+    pub(crate) fn reset(&mut self, sequence: u16, ack: u16, ack_bits: u32, num_fragments: u8) {
+        self.sequence = sequence;
+        self.ack = ack;
+        self.ack_bits = ack_bits;
+        self.num_fragments = num_fragments;
+        self.num_fragments_received = 0;
+        self.fragment_received = [0u32; 8];
+        for len in &mut self.fragment_lens[..num_fragments as usize] {
+            *len = 0;
+        }
     }
 
-    /// Check if all fragments have been received
-    pub fn is_complete(&self) -> bool {
+    /// Returns `true` if fragment `id` has already been received.
+    #[inline]
+    pub(crate) fn has_fragment(&self, id: u8) -> bool {
+        let word = (id >> 5) as usize;
+        let bit = id & 31;
+        (self.fragment_received[word] & (1 << bit)) != 0
+    }
+
+    /// Mark fragment `id` as received in the bitmask.
+    #[inline]
+    pub(crate) fn mark_fragment(&mut self, id: u8) {
+        let word = (id >> 5) as usize;
+        let bit = id & 31;
+        self.fragment_received[word] |= 1 << bit;
+    }
+
+    /// Returns `true` when all expected fragments have arrived.
+    #[inline]
+    pub(crate) fn is_complete(&self) -> bool {
         self.num_fragments_received == self.num_fragments
     }
 
-    /// Reassemble all fragments into a single packet
-    pub fn reassemble(&self) -> Vec<u8> {
-        let mut result = Vec::new();
-        for fragment in &self.fragments {
-            result.extend_from_slice(fragment);
+    /// Write `src` into the slab at the offset for fragment `id`.
+    ///
+    /// Allocation-free. Bytes beyond `fragment_size` are silently truncated.
+    #[inline]
+    pub(crate) fn store_fragment(&mut self, id: u8, src: &[u8]) {
+        let offset = id as usize * self.fragment_size;
+        let len = src.len().min(self.fragment_size);
+        self.fragment_data[offset..offset + len].copy_from_slice(&src[..len]);
+        self.fragment_lens[id as usize] = len as u16;
+    }
+
+    /// Copy reassembled payload into `dest`, returning the number of bytes
+    /// written. Used in `receive_fragment` when endpoint writes directly into an
+    /// [`incoming_queue`](crate::packet_queue::PacketQueue) slot.
+    ///
+    /// Allocation-free.
+    pub(crate) fn copy_to(&self, dest: &mut [u8]) -> usize {
+        let mut pos = 0;
+        for i in 0..self.num_fragments as usize {
+            let len = self.fragment_lens[i] as usize;
+            let src_off = i * self.fragment_size;
+            dest[pos..pos + len].copy_from_slice(&self.fragment_data[src_off..src_off + len]);
+            pos += len;
         }
-        result
+        pos
     }
 }
 
-/// Fragment reassembly buffer
+/// Fragment reassembly buffer.
+///
+/// Uses a [`SequenceBuffer<()>`] for sequence-window bookkeeping and a
+/// separate `Box<[ReassemblyData]>` for the preallocated payload slabs.
+/// Slot index is always `sequence & (capacity - 1)`.
+///
+/// All `ReassemblyData` slots are fully preallocated in [`new`]; no heap
+/// activity occurs during steady-state fragment processing.
 pub(crate) struct FragmentReassemblyBuffer {
-    buffer: SequenceBuffer<ReassemblyData>,
+    /// Tracks which sequences are active and manages the eviction window.
+    tracker: SequenceBuffer<()>,
+    /// Preallocated per-slot reassembly state. Indexed by `seq & (capacity - 1)`.
+    slots: Box<[ReassemblyData]>,
+    /// Cached buffer capacity (= `slots.len()`). Must be a power of two.
+    capacity: usize,
     max_fragments: usize,
 }
 
 impl FragmentReassemblyBuffer {
-    /// Create a new fragment reassembly buffer
-    pub fn new(size: usize, _fragment_size: usize, max_fragments: usize) -> Self {
+    /// Create a new fragment reassembly buffer with all slabs preallocated.
+    pub fn new(size: usize, fragment_size: usize, max_fragments: usize) -> Self {
+        let slots: Vec<ReassemblyData> = (0..size)
+            .map(|_| ReassemblyData::new_preallocated(max_fragments, fragment_size))
+            .collect();
+
         Self {
-            buffer: SequenceBuffer::new(size),
+            tracker: SequenceBuffer::new(size),
+            slots: slots.into_boxed_slice(),
+            capacity: size,
             max_fragments,
         }
     }
 
-    /// Process a received fragment
+    /// Process a received fragment.
     ///
-    /// Returns Some(packet_data) if the packet is complete
+    /// On success, writes the reassembled payload into `incoming_queue` via
+    /// [`PacketQueue::write_slot`] and returns `Some(payload_bytes)`. Returns `None` if
+    /// reassembly is not yet complete, the fragment is invalid or duplicate, or the
+    /// incoming queue is full (drop with `log::warn!`).
+    ///
+    /// Allocation-free on the hot path.
     pub fn process_fragment(
         &mut self,
         header: &FragmentHeader,
         fragment_data: &[u8],
         ack: u16,
         ack_bits: u32,
-    ) -> Option<Vec<u8>> {
-        // Validate fragment
+        incoming_queue: &mut PacketQueue,
+    ) -> Option<usize> {
+        // Validate fragment metadata.
         if header.num_fragments == 0 || header.num_fragments as usize > self.max_fragments {
             log::warn!(
                 "Invalid num_fragments: {} (max: {})",
@@ -210,39 +305,48 @@ impl FragmentReassemblyBuffer {
             return None;
         }
 
-        // Get or create reassembly entry
-        let is_new = !self.buffer.exists(header.sequence);
-
-        if is_new && self.buffer.insert(header.sequence).is_none() {
-            log::warn!("Failed to insert reassembly entry");
-            return None;
-        }
-
-        let entry = self.buffer.find_mut(header.sequence)?;
+        let is_new = !self.tracker.exists(header.sequence);
 
         if is_new {
-            // Initialize new entry
-            entry.sequence = header.sequence;
-            entry.ack = ack;
-            entry.ack_bits = ack_bits;
-            entry.num_fragments = header.num_fragments;
+            if !self.tracker.can_insert(header.sequence) {
+                log::warn!(
+                    "Reassembly buffer full or sequence too old: {}",
+                    header.sequence
+                );
+                return None;
+            }
+            // Advance the tracker window. Return value is () - discard.
+            let _ = self.tracker.insert(header.sequence);
 
-            // Pre-allocate fragment storage
-            entry.fragments = vec![Vec::new(); header.num_fragments as usize];
+            // Reset the preallocated slab for this slot (no allocation).
+            let idx = header.sequence as usize & (self.capacity - 1);
+            self.slots[idx].reset(header.sequence, ack, ack_bits, header.num_fragments);
         } else {
-            // Verify consistency
-            if entry.num_fragments != header.num_fragments {
+            let idx = header.sequence as usize & (self.capacity - 1);
+            let slot = &self.slots[idx];
+            // Guard against hash collision if tracker and slots are ever desynced.
+            if slot.sequence != header.sequence {
+                log::warn!(
+                    "Reassembly slot sequence mismatch: expected {}, got {}",
+                    header.sequence,
+                    slot.sequence
+                );
+                return None;
+            }
+            if slot.num_fragments != header.num_fragments {
                 log::warn!(
                     "Fragment count mismatch: {} vs {}",
-                    entry.num_fragments,
+                    slot.num_fragments,
                     header.num_fragments
                 );
                 return None;
             }
         }
 
-        // Check for duplicate
-        if entry.has_fragment(header.fragment_id) {
+        let idx = header.sequence as usize & (self.capacity - 1);
+
+        // Drop duplicates.
+        if self.slots[idx].has_fragment(header.fragment_id) {
             log::debug!(
                 "Duplicate fragment {} for sequence {}",
                 header.fragment_id,
@@ -251,31 +355,53 @@ impl FragmentReassemblyBuffer {
             return None;
         }
 
-        // Store fragment data
-        let idx = header.fragment_id as usize;
-        entry.fragments[idx] = fragment_data.to_vec();
+        // Store into preallocated slab - allocation-free.
+        self.slots[idx].store_fragment(header.fragment_id, fragment_data);
+        self.slots[idx].mark_fragment(header.fragment_id);
+        self.slots[idx].num_fragments_received += 1;
 
-        // Mark fragment as received
-        entry.mark_fragment(header.fragment_id);
-        entry.num_fragments_received += 1;
-
-        // Check if complete
-        if entry.is_complete() {
-            let result = self.buffer.remove(header.sequence)?.reassemble();
-            Some(result)
+        if self.slots[idx].is_complete() {
+            // Write reassembled payload directly into the incoming queue slot - zero-alloc.
+            // See ADR-002 for rationale on passing incoming_queue as parameter.
+            let mut payload_len = 0usize;
+            let delivered = incoming_queue.write_slot(header.sequence, |buf| {
+                let n = self.slots[idx].copy_to(buf);
+                payload_len = n;
+                n
+            });
+            self.tracker.remove(header.sequence);
+            if delivered {
+                Some(payload_len)
+            } else {
+                log::warn!(
+                    "incoming_queue full, dropping reassembled packet seq={}",
+                    header.sequence
+                );
+                None
+            }
         } else {
             None
         }
     }
 
-    /// Reset the buffer
+    /// Reset the buffer, discarding all in-progress reassembly.
+    ///
+    /// Preallocated slabs are retained.
     pub fn reset(&mut self) {
-        self.buffer.reset();
+        self.tracker.reset();
+        // Slot data is overwritten by reset() on next use - no need to clear now.
     }
 }
 
-/// Fragment a packet into multiple parts
-pub fn fragment_packet(
+/// Fragment a packet into multiple parts.
+///
+/// Returns `None` if `data` is empty, `fragment_size` is zero, or the number
+/// of fragments would exceed `max_fragments` or 255.
+///
+/// Used only in unit tests. Hot path in `endpoint.rs` inlines fragment
+/// creation directly into `PacketQueue::write_slot` calls.
+#[allow(dead_code)]
+pub(crate) fn fragment_packet(
     sequence: u16,
     data: &[u8],
     fragment_size: usize,
@@ -312,6 +438,18 @@ pub fn fragment_packet(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::packet_queue::PacketQueue;
+
+    /// Helper: drain first payload from a PacketQueue into a Vec.
+    fn drain_first(q: &mut PacketQueue) -> Vec<u8> {
+        let mut out = Vec::new();
+        q.drain(|_, data| {
+            if out.is_empty() {
+                out.extend_from_slice(data);
+            }
+        });
+        out
+    }
 
     #[test]
     fn test_fragment_header_roundtrip() {
@@ -350,18 +488,19 @@ mod tests {
         let fragments = fragment_packet(42, &data, 4, 16).unwrap();
 
         let mut reassembly = FragmentReassemblyBuffer::new(64, 4, 16);
+        let mut q = PacketQueue::new(16, 4096);
 
         // Process fragments out of order
-        let result0 = reassembly.process_fragment(&fragments[2].0, &fragments[2].1, 0, 0);
+        let result0 = reassembly.process_fragment(&fragments[2].0, &fragments[2].1, 0, 0, &mut q);
         assert!(result0.is_none());
 
-        let result1 = reassembly.process_fragment(&fragments[0].0, &fragments[0].1, 0, 0);
+        let result1 = reassembly.process_fragment(&fragments[0].0, &fragments[0].1, 0, 0, &mut q);
         assert!(result1.is_none());
 
-        let result2 = reassembly.process_fragment(&fragments[1].0, &fragments[1].1, 0, 0);
+        let result2 = reassembly.process_fragment(&fragments[1].0, &fragments[1].1, 0, 0, &mut q);
         assert!(result2.is_some());
 
-        let reassembled = result2.unwrap();
+        let reassembled = drain_first(&mut q);
         assert_eq!(reassembled, data);
     }
 
@@ -371,18 +510,19 @@ mod tests {
         let fragments = fragment_packet(42, &data, 4, 16).unwrap();
 
         let mut reassembly = FragmentReassemblyBuffer::new(64, 4, 16);
+        let mut q = PacketQueue::new(16, 4096);
 
         // Process fragments in order
-        let result0 = reassembly.process_fragment(&fragments[0].0, &fragments[0].1, 0, 0);
+        let result0 = reassembly.process_fragment(&fragments[0].0, &fragments[0].1, 0, 0, &mut q);
         assert!(result0.is_none());
 
-        let result1 = reassembly.process_fragment(&fragments[1].0, &fragments[1].1, 0, 0);
+        let result1 = reassembly.process_fragment(&fragments[1].0, &fragments[1].1, 0, 0, &mut q);
         assert!(result1.is_none());
 
-        let result2 = reassembly.process_fragment(&fragments[2].0, &fragments[2].1, 0, 0);
+        let result2 = reassembly.process_fragment(&fragments[2].0, &fragments[2].1, 0, 0, &mut q);
         assert!(result2.is_some());
 
-        let reassembled = result2.unwrap();
+        let reassembled = drain_first(&mut q);
         assert_eq!(reassembled, data);
     }
 
@@ -392,12 +532,13 @@ mod tests {
         let fragments = fragment_packet(42, &data, 4, 16).unwrap();
 
         let mut reassembly = FragmentReassemblyBuffer::new(64, 4, 16);
+        let mut q = PacketQueue::new(16, 4096);
 
         // Process first fragment
-        reassembly.process_fragment(&fragments[0].0, &fragments[0].1, 0, 0);
+        reassembly.process_fragment(&fragments[0].0, &fragments[0].1, 0, 0, &mut q);
 
         // Duplicate should return None
-        let duplicate = reassembly.process_fragment(&fragments[0].0, &fragments[0].1, 0, 0);
+        let duplicate = reassembly.process_fragment(&fragments[0].0, &fragments[0].1, 0, 0, &mut q);
         assert!(duplicate.is_none());
     }
 
@@ -419,16 +560,68 @@ mod tests {
         assert_eq!(fragments.len(), 8); // 1000 / 128 = 7.8125, rounds up to 8
 
         let mut reassembly = FragmentReassemblyBuffer::new(64, 128, 16);
+        let mut q = PacketQueue::new(16, 4096);
 
         // Process in reverse order
         for i in (0..fragments.len()).rev() {
-            let result = reassembly.process_fragment(&fragments[i].0, &fragments[i].1, 0, 0);
+            let result =
+                reassembly.process_fragment(&fragments[i].0, &fragments[i].1, 0, 0, &mut q);
             if i == 0 {
                 assert!(result.is_some());
-                assert_eq!(result.unwrap(), data);
             } else {
                 assert!(result.is_none());
             }
         }
+
+        let reassembled = drain_first(&mut q);
+        assert_eq!(reassembled, data);
+    }
+
+    #[test]
+    fn test_reassembly_reset_reuses_slab() {
+        // Verify reset() retains preallocated slabs and allows reuse.
+        let data = vec![42u8; 8];
+        let fragments = fragment_packet(1, &data, 4, 16).unwrap();
+
+        let mut buf = FragmentReassemblyBuffer::new(64, 4, 16);
+        let mut q = PacketQueue::new(16, 4096);
+
+        for frag in &fragments {
+            buf.process_fragment(&frag.0, &frag.1, 0, 0, &mut q);
+        }
+        q.clear(); // discard first reassembly result
+
+        buf.reset();
+
+        // Same sequence should be accepted again after reset.
+        let fragments2 = fragment_packet(1, &data, 4, 16).unwrap();
+        let mut last = None;
+        for frag in &fragments2 {
+            last = buf.process_fragment(&frag.0, &frag.1, 0, 0, &mut q);
+        }
+        assert!(last.is_some());
+
+        let reassembled = drain_first(&mut q);
+        assert_eq!(reassembled, data);
+    }
+
+    #[test]
+    fn test_copy_to() {
+        // Directly test the copy_to method on ReassemblyData.
+        let mut rd = ReassemblyData::new_preallocated(4, 8);
+        rd.reset(0, 0, 0, 3);
+
+        rd.store_fragment(0, &[1, 2, 3, 4]);
+        rd.store_fragment(1, &[5, 6]);
+        rd.store_fragment(2, &[7, 8, 9]);
+        rd.mark_fragment(0);
+        rd.mark_fragment(1);
+        rd.mark_fragment(2);
+        rd.num_fragments_received = 3;
+
+        let mut dest = vec![0u8; 32];
+        let written = rd.copy_to(&mut dest);
+        assert_eq!(written, 9);
+        assert_eq!(&dest[..9], &[1, 2, 3, 4, 5, 6, 7, 8, 9]);
     }
 }

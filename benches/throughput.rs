@@ -17,10 +17,10 @@ fn benchmark_send_receive(c: &mut Criterion) {
 
         b.iter(|| {
             client.send_packet(black_box(&data));
-            for (_, packet) in client.take_outgoing_packets() {
-                server.receive_packet(black_box(&packet));
-            }
-            black_box(server.take_incoming_packets().len())
+            client.drain_outgoing(|_, packet| server.receive_packet(black_box(packet)));
+            let mut count = 0usize;
+            server.drain_incoming(|_, _| count += 1);
+            black_box(count)
         });
     });
 
@@ -34,10 +34,10 @@ fn benchmark_send_receive(c: &mut Criterion) {
 
         b.iter(|| {
             client.send_packet(black_box(&data));
-            for (_, packet) in client.take_outgoing_packets() {
-                server.receive_packet(black_box(&packet));
-            }
-            black_box(server.take_incoming_packets().len())
+            client.drain_outgoing(|_, packet| server.receive_packet(black_box(packet)));
+            let mut count = 0usize;
+            server.drain_incoming(|_, _| count += 1);
+            black_box(count)
         });
     });
 
@@ -51,10 +51,10 @@ fn benchmark_send_receive(c: &mut Criterion) {
 
         b.iter(|| {
             client.send_packet(black_box(&data));
-            for (_, packet) in client.take_outgoing_packets() {
-                server.receive_packet(black_box(&packet));
-            }
-            black_box(server.take_incoming_packets().len())
+            client.drain_outgoing(|_, packet| server.receive_packet(black_box(packet)));
+            let mut count = 0usize;
+            server.drain_incoming(|_, _| count += 1);
+            black_box(count)
         });
     });
 
@@ -99,8 +99,8 @@ fn benchmark_sequence_buffer(c: &mut Criterion) {
             for i in 0..100u16 {
                 endpoint.send_packet(black_box(&[i as u8; 32]));
             }
-            // Consume iterator and count - prevents DCE while measuring actual work
-            let count = endpoint.take_outgoing_packets().len();
+            let mut count = 0usize;
+            endpoint.drain_outgoing(|_, _| count += 1);
             black_box(count)
         });
     });
@@ -116,7 +116,7 @@ fn benchmark_ack_processing(c: &mut Criterion) {
         let mut client = Endpoint::new(config.clone(), 0.0);
         let mut server = Endpoint::new(config.clone(), 0.0);
 
-        // Preallocate transfer buffer
+        // Preallocate staging buffer (outside measured section)
         let mut transfer_buf: Vec<Vec<u8>> = Vec::with_capacity(64);
 
         b.iter(|| {
@@ -129,25 +129,23 @@ fn benchmark_ack_processing(c: &mut Criterion) {
                 client.send_packet(black_box(&[i; 64]));
             }
 
-            // Transfer client -> server
+            // Transfer client -> server (collect then deliver to allow reset between phases)
             transfer_buf.clear();
-            for (_, data) in client.take_outgoing_packets() {
-                transfer_buf.push(data);
-            }
+            client.drain_outgoing(|_, data| transfer_buf.push(data.to_vec()));
             for data in &transfer_buf {
                 server.receive_packet(data);
             }
             // Consume incoming
-            let _ = server.take_incoming_packets().len();
+            let mut in_count = 0usize;
+            server.drain_incoming(|_, _| in_count += 1);
+            black_box(in_count);
 
             // Server sends response (triggers ACK)
             server.send_packet(b"ack");
 
             // Transfer server -> client
             transfer_buf.clear();
-            for (_, data) in server.take_outgoing_packets() {
-                transfer_buf.push(data);
-            }
+            server.drain_outgoing(|_, data| transfer_buf.push(data.to_vec()));
             for data in &transfer_buf {
                 client.receive_packet(data);
             }

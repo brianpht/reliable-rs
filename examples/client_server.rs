@@ -97,18 +97,16 @@ fn main() {
         }
 
         // Network: client -> server
-        for (_seq, data) in client.take_outgoing_packets() {
-            server.receive_packet(&data);
-        }
+        client.drain_outgoing(|_, data| server.receive_packet(data));
 
-        // Server processes messages
-        for (_seq, data) in server.take_incoming_packets() {
-            if let Some(msg) = Message::deserialize(&data) {
+        // Server processes messages - collect responses first to avoid borrow conflict
+        let mut server_responses: Vec<Vec<u8>> = Vec::new();
+        server.drain_incoming(|_, data| {
+            if let Some(msg) = Message::deserialize(data) {
                 match msg {
                     Message::Ping { id } => {
                         println!("[{:.2}s] Server received Ping #{}, sending Pong", time, id);
-                        let response = Message::Pong { id };
-                        server.send_packet(&response.serialize());
+                        server_responses.push(Message::Pong { id }.serialize());
                     }
                     Message::Data { content } => {
                         println!("[{:.2}s] Server received data: {}", time, content);
@@ -116,16 +114,17 @@ fn main() {
                     _ => {}
                 }
             }
+        });
+        for response in &server_responses {
+            server.send_packet(response);
         }
 
         // Network: server -> client
-        for (_seq, data) in server.take_outgoing_packets() {
-            client.receive_packet(&data);
-        }
+        server.drain_outgoing(|_, data| client.receive_packet(data));
 
         // Client processes responses
-        for (_seq, data) in client.take_incoming_packets() {
-            if let Some(msg) = Message::deserialize(&data) {
+        client.drain_incoming(|_, data| {
+            if let Some(msg) = Message::deserialize(data) {
                 if let Message::Pong { id } = msg {
                     if let Some(send_time) = pending_pings.remove(&id) {
                         let rtt = (time - send_time) * 1000.0;
@@ -136,7 +135,7 @@ fn main() {
                     }
                 }
             }
-        }
+        });
 
         client.clear_acks();
         server.clear_acks();

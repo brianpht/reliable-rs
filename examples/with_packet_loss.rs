@@ -28,39 +28,39 @@ fn main() {
         client.send_packet(format!("Message {}", frame).as_bytes());
 
         // Simulate lossy network: client -> server
-        for (_seq, data) in client.take_outgoing_packets() {
+        client.drain_outgoing(|_, data| {
             total_sent += 1;
             if rng.random_range(0..100) >= packet_loss_percent {
-                server.receive_packet(&data);
+                server.receive_packet(data);
             } else {
                 total_dropped += 1;
             }
-        }
+        });
 
         // Server processes and responds
-        for (seq, data) in server.take_incoming_packets() {
+        server.drain_incoming(|seq, data| {
             if frame % 50 == 0 {
                 println!(
                     "Server received packet {}: {}",
                     seq,
-                    String::from_utf8_lossy(&data)
+                    String::from_utf8_lossy(data)
                 );
             }
-        }
+        });
 
         server.send_packet(b"Response");
 
         // Simulate lossy network: server -> client
-        for (_seq, data) in server.take_outgoing_packets() {
+        server.drain_outgoing(|_, data| {
             total_sent += 1;
             if rng.random_range(0..100) >= packet_loss_percent {
-                client.receive_packet(&data);
+                client.receive_packet(data);
             } else {
                 total_dropped += 1;
             }
-        }
+        });
 
-        client.take_incoming_packets();
+        client.drain_incoming(|_, _| {});
         client.clear_acks();
 
         // Update

@@ -7,15 +7,15 @@
 //!     |
 //!     +-- send_packet(payload)        // queue one logical packet
 //!     |       |-- fragment if payload > config.fragment_above
-//!     |       +-- push to outgoing_packets
+//!     |       +-- push to outgoing_queue (preallocated ring)
 //!     |
-//!     +-- take_outgoing_packets()     // drain and hand to UDP layer
+//!     +-- drain_outgoing(|seq, bytes| ...)  // hand datagrams to UDP layer (zero-alloc)
 //!     |
 //!     +-- receive_packet(wire_bytes)  // feed a single UDP datagram
 //!     |       |-- regular: decode PacketHeader, track recv, process ACKs
 //!     |       +-- fragment: decode FragmentHeader, reassemble, track recv
 //!     |
-//!     +-- take_incoming_packets()     // drain reassembled payloads
+//!     +-- drain_incoming(|seq, payload| ...)  // read reassembled payloads (zero-alloc)
 //!     |
 //!     +-- update(current_time)        // call once per tick to update stats
 //!     |       |-- update_packet_loss()
@@ -32,8 +32,9 @@
 //!
 //! The receiver calls [`process_acks`](Endpoint) internally on each
 //! incoming datagram. When a sent-packet entry is found unacked, it is
-//! marked acked, pushed to the acks list, and its RTT sample is folded
-//! into the EMA estimate.
+//! marked acked, recorded in the bounded `ack_buf`, and its RTT sample is folded
+//! into the EMA estimate. If `ack_buf` is full, the ACK is dropped with
+//! `log::debug!` - see ADR-003.
 //!
 //! ## Statistics
 //!
@@ -44,13 +45,10 @@
 //! - **Bandwidth** - sent / received / acked kbps computed from ring-buffer
 //!   timestamps and byte counts (smoothed EMA)
 
-use std::collections::VecDeque;
-
 use crate::config::EndpointConfig;
-use crate::fragment::{
-    FRAGMENT_HEADER_BYTES, FragmentHeader, FragmentReassemblyBuffer, fragment_packet,
-};
+use crate::fragment::{FragmentHeader, FragmentReassemblyBuffer};
 use crate::packet::{MAX_PACKET_HEADER_BYTES, PacketHeader, is_fragment_packet};
+use crate::packet_queue::PacketQueue;
 use crate::sequence_buffer::SequenceBuffer;
 use crate::utils::smooth_value;
 
@@ -104,18 +102,29 @@ pub struct Endpoint {
     sent_bandwidth_kbps: f32,
     received_bandwidth_kbps: f32,
     acked_bandwidth_kbps: f32,
-    acks: Vec<u16>,
+    /// Preallocated ACK notification buffer. Sized to `sent_packets_buffer_size`.
+    /// See ADR-003 for drop policy when full.
+    ack_buf: Box<[u16]>,
+    ack_count: usize,
     counters: EndpointCounters,
     sent_packets: SequenceBuffer<SentPacketData>,
     received_packets: SequenceBuffer<ReceivedPacketData>,
     fragment_reassembly: FragmentReassemblyBuffer,
-    outgoing_packets: VecDeque<(u16, Vec<u8>)>,
-    incoming_packets: VecDeque<(u16, Vec<u8>)>,
+    /// Preallocated ring buffer for outgoing datagrams.
+    /// Slot capacity = `config.max_datagram_size()`.
+    outgoing_queue: PacketQueue,
+    /// Preallocated ring buffer for received payloads (after reassembly).
+    /// Slot capacity = `config.max_packet_size`.
+    incoming_queue: PacketQueue,
 }
 
 impl Endpoint {
     /// Create a new endpoint with the given configuration
     pub fn new(config: EndpointConfig, time: f64) -> Self {
+        let ack_buf = vec![0u16; config.sent_packets_buffer_size].into_boxed_slice();
+        let outgoing_queue =
+            PacketQueue::new(config.outgoing_queue_size, config.max_datagram_size());
+        let incoming_queue = PacketQueue::new(config.incoming_queue_size, config.max_packet_size);
         Self {
             sent_packets: SequenceBuffer::new(config.sent_packets_buffer_size),
             received_packets: SequenceBuffer::new(config.received_packets_buffer_size),
@@ -124,6 +133,10 @@ impl Endpoint {
                 config.fragment_size,
                 config.max_fragments,
             ),
+            outgoing_queue,
+            incoming_queue,
+            ack_buf,
+            ack_count: 0,
             config,
             time,
             sequence: 0,
@@ -132,10 +145,7 @@ impl Endpoint {
             sent_bandwidth_kbps: 0.0,
             received_bandwidth_kbps: 0.0,
             acked_bandwidth_kbps: 0.0,
-            acks: Vec::new(),
             counters: EndpointCounters::default(),
-            outgoing_packets: VecDeque::new(),
-            incoming_packets: VecDeque::new(),
         }
     }
 
@@ -151,8 +161,8 @@ impl Endpoint {
 
     /// Send a packet
     ///
-    /// The packet will be fragmented if necessary. Call `take_outgoing_packets()`
-    /// to get the actual data to send over the network.
+    /// The packet will be fragmented if necessary. Call [`drain_outgoing`](Endpoint::drain_outgoing)
+    /// to hand the encoded datagrams to the UDP layer.
     pub fn send_packet(&mut self, data: &[u8]) {
         if data.len() > self.config.max_packet_size {
             log::warn!(
@@ -188,52 +198,70 @@ impl Endpoint {
 
     fn send_regular_packet(&mut self, sequence: u16, data: &[u8], ack: u16, ack_bits: u32) {
         let header = PacketHeader::new(sequence, ack, ack_bits);
-
-        let mut buffer = Vec::with_capacity(MAX_PACKET_HEADER_BYTES + data.len());
-        header.write(&mut buffer);
-        buffer.extend_from_slice(data);
-
-        self.outgoing_packets.push_back((sequence, buffer));
+        self.outgoing_queue.write_slot(sequence, |buf| {
+            let hdr_len = match header.write_to_slice(buf) {
+                Some(n) => n,
+                None => return 0,
+            };
+            let payload_len = data.len().min(buf.len().saturating_sub(hdr_len));
+            buf[hdr_len..hdr_len + payload_len].copy_from_slice(&data[..payload_len]);
+            hdr_len + payload_len
+        });
     }
 
     fn send_fragmented_packet(&mut self, sequence: u16, data: &[u8], ack: u16, ack_bits: u32) {
-        let fragments = match fragment_packet(
-            sequence,
-            data,
-            self.config.fragment_size,
-            self.config.max_fragments,
-        ) {
-            Some(f) => f,
-            None => {
-                log::error!("Failed to fragment packet");
-                return;
-            }
-        };
+        let fragment_size = self.config.fragment_size;
+        let num_fragments = data.len().div_ceil(fragment_size);
 
-        for (i, (frag_header, frag_data)) in fragments.into_iter().enumerate() {
-            let mut buffer = Vec::with_capacity(
-                FRAGMENT_HEADER_BYTES + MAX_PACKET_HEADER_BYTES + frag_data.len(),
+        if num_fragments > self.config.max_fragments || num_fragments > 255 {
+            log::error!(
+                "send_fragmented_packet: {} fragments needed but max is {}",
+                num_fragments,
+                self.config.max_fragments.min(255)
             );
+            return;
+        }
 
-            // Write fragment header
-            frag_header.write(&mut buffer);
+        let num_fragments_u8 = num_fragments as u8;
+        let packet_header = PacketHeader::new(sequence, ack, ack_bits);
 
-            // For first fragment, include packet header for ack/ack_bits
-            if i == 0 {
-                let packet_header = PacketHeader::new(sequence, ack, ack_bits);
-                packet_header.write(&mut buffer);
-            }
+        for (i, chunk) in data.chunks(fragment_size).enumerate() {
+            let frag_header = FragmentHeader {
+                sequence,
+                fragment_id: i as u8,
+                num_fragments: num_fragments_u8,
+            };
 
-            buffer.extend_from_slice(&frag_data);
+            self.outgoing_queue.write_slot(sequence, |buf| {
+                let mut pos = 0;
 
-            self.outgoing_packets.push_back((sequence, buffer));
+                // Write fragment header (always present)
+                match frag_header.write_to_slice(buf) {
+                    Some(n) => pos += n,
+                    None => return 0,
+                }
+
+                // First fragment: include packet header for ACK piggyback
+                if i == 0 {
+                    match packet_header.write_to_slice(&mut buf[pos..]) {
+                        Some(n) => pos += n,
+                        None => return 0,
+                    }
+                }
+
+                // Write fragment payload
+                let chunk_len = chunk.len().min(buf.len().saturating_sub(pos));
+                buf[pos..pos + chunk_len].copy_from_slice(&chunk[..chunk_len]);
+                pos + chunk_len
+            });
+
             self.counters.fragments_sent += 1;
         }
     }
 
     /// Receive a packet from the network
     ///
-    /// Call `take_incoming_packets()` to get the processed packet data.
+    /// Call [`drain_incoming`](Endpoint::drain_incoming) to read processed packet payloads.
     pub fn receive_packet(&mut self, data: &[u8]) {
         if data.is_empty() {
             return;
@@ -285,11 +313,10 @@ impl Endpoint {
         // Process acknowledgments
         self.process_acks(header.ack, header.ack_bits);
 
-        // Extract payload
+        // Push payload into incoming queue - zero-alloc
         let payload = &data[header_size..];
         if !payload.is_empty() {
-            self.incoming_packets
-                .push_back((header.sequence, payload.to_vec()));
+            self.incoming_queue.push(header.sequence, payload);
         }
     }
 
@@ -347,22 +374,23 @@ impl Endpoint {
 
         let fragment_data = &data[pos..];
 
-        // Try to reassemble
-        if let Some(reassembled) =
-            self.fragment_reassembly
-                .process_fragment(&frag_header, fragment_data, ack, ack_bits)
-        {
+        // Disjoint field borrow: fragment_reassembly and incoming_queue are separate fields.
+        // Rust 2021 NLL allows concurrent mutable borrows of disjoint struct fields.
+        // See ADR-002 for design rationale.
+        if let Some(payload_len) = self.fragment_reassembly.process_fragment(
+            &frag_header,
+            fragment_data,
+            ack,
+            ack_bits,
+            &mut self.incoming_queue,
+        ) {
             self.counters.packets_received += 1;
 
             // Track as received
             if let Some(recv_data) = self.received_packets.insert(frag_header.sequence) {
                 recv_data.time = self.time;
-                recv_data.packet_bytes =
-                    (self.config.packet_header_size + reassembled.len()) as u32;
+                recv_data.packet_bytes = (self.config.packet_header_size + payload_len) as u32;
             }
-
-            self.incoming_packets
-                .push_back((frag_header.sequence, reassembled));
         }
     }
 
@@ -390,7 +418,15 @@ impl Endpoint {
                     && !sent_data.acked
                 {
                     sent_data.acked = true;
-                    self.acks.push(ack_sequence);
+
+                    // Bounded ACK buffer - see ADR-003 for drop policy.
+                    if self.ack_count < self.ack_buf.len() {
+                        self.ack_buf[self.ack_count] = ack_sequence;
+                        self.ack_count += 1;
+                    } else {
+                        log::debug!("ack_buf full, dropping ack {}", ack_sequence);
+                    }
+
                     self.counters.packets_acked += 1;
 
                     // Update RTT
@@ -406,14 +442,48 @@ impl Endpoint {
         }
     }
 
-    /// Take outgoing packets to send over the network
-    pub fn take_outgoing_packets(&mut self) -> Vec<(u16, Vec<u8>)> {
-        self.outgoing_packets.drain(..).collect()
+    /// Drain outgoing datagrams via zero-alloc closure.
+    ///
+    /// Calls `f(sequence, wire_bytes)` for each queued datagram, then resets the
+    /// outgoing queue to empty. The `wire_bytes` slice is borrowed from a
+    /// preallocated slot and is valid only for the duration of the closure call.
+    ///
+    /// Hot path - allocation-free.
+    pub fn drain_outgoing(&mut self, f: impl FnMut(u16, &[u8])) {
+        self.outgoing_queue.drain(f);
     }
 
-    /// Take incoming packets that have been processed
+    /// Drain incoming reassembled payloads via zero-alloc closure.
+    ///
+    /// Calls `f(sequence, payload)` for each received packet, then resets the
+    /// incoming queue to empty. The `payload` slice is borrowed from a
+    /// preallocated slot and is valid only for the duration of the closure call.
+    ///
+    /// Hot path - allocation-free.
+    pub fn drain_incoming(&mut self, f: impl FnMut(u16, &[u8])) {
+        self.incoming_queue.drain(f);
+    }
+
+    /// Take outgoing packets to send over the network.
+    ///
+    /// Allocates a `Vec` on every call. Prefer [`drain_outgoing`](Endpoint::drain_outgoing)
+    /// to avoid allocation.
+    #[deprecated(since = "0.2.0", note = "use drain_outgoing to avoid allocation")]
+    pub fn take_outgoing_packets(&mut self) -> Vec<(u16, Vec<u8>)> {
+        let mut out = Vec::new();
+        self.drain_outgoing(|seq, data| out.push((seq, data.to_vec())));
+        out
+    }
+
+    /// Take incoming packets that have been processed.
+    ///
+    /// Allocates a `Vec` on every call. Prefer [`drain_incoming`](Endpoint::drain_incoming)
+    /// to avoid allocation.
+    #[deprecated(since = "0.2.0", note = "use drain_incoming to avoid allocation")]
     pub fn take_incoming_packets(&mut self) -> Vec<(u16, Vec<u8>)> {
-        self.incoming_packets.drain(..).collect()
+        let mut out = Vec::new();
+        self.drain_incoming(|seq, data| out.push((seq, data.to_vec())));
+        out
     }
 
     /// Update the endpoint state
@@ -545,20 +615,23 @@ impl Endpoint {
         }
     }
 
-    /// Get acknowledged packet sequences
+    /// Get acknowledged packet sequences.
+    ///
+    /// Returns a slice of the bounded ACK buffer. Call [`clear_acks`](Endpoint::clear_acks)
+    /// once per tick to avoid buffer overflow (see ADR-003).
     pub fn get_acks(&self) -> &[u16] {
-        &self.acks
+        &self.ack_buf[..self.ack_count]
     }
 
     /// Clear acknowledged packet sequences
     pub fn clear_acks(&mut self) {
-        self.acks.clear();
+        self.ack_count = 0;
     }
 
     /// Reset the endpoint to initial state
     pub fn reset(&mut self) {
         self.sequence = 0;
-        self.acks.clear();
+        self.ack_count = 0;
         self.rtt = 0.0;
         self.packet_loss = 0.0;
         self.sent_bandwidth_kbps = 0.0;
@@ -568,8 +641,8 @@ impl Endpoint {
         self.sent_packets.reset();
         self.received_packets.reset();
         self.fragment_reassembly.reset();
-        self.outgoing_packets.clear();
-        self.incoming_packets.clear();
+        self.outgoing_queue.clear();
+        self.incoming_queue.clear();
     }
 
     /// Get the current RTT estimate in milliseconds
@@ -618,19 +691,18 @@ mod tests {
         let mut client = create_test_endpoint("client");
         let mut server = create_test_endpoint("server");
 
-        // Client sends packet
         let data = b"Hello, Server!";
         client.send_packet(data);
 
-        // Get outgoing packets
-        let outgoing = client.take_outgoing_packets();
-        assert_eq!(outgoing.len(), 1);
+        let mut outgoing_count = 0usize;
+        client.drain_outgoing(|_, wire| {
+            outgoing_count += 1;
+            server.receive_packet(wire);
+        });
+        assert_eq!(outgoing_count, 1);
 
-        // Server receives
-        server.receive_packet(&outgoing[0].1);
-
-        // Check incoming
-        let incoming = server.take_incoming_packets();
+        let mut incoming: Vec<(u16, Vec<u8>)> = Vec::new();
+        server.drain_incoming(|seq, d| incoming.push((seq, d.to_vec())));
         assert_eq!(incoming.len(), 1);
         assert_eq!(&incoming[0].1, data);
     }
@@ -642,15 +714,11 @@ mod tests {
 
         // Client sends
         client.send_packet(b"ping");
-        let client_packets = client.take_outgoing_packets();
+        client.drain_outgoing(|_, data| server.receive_packet(data));
 
         // Server receives and sends response
-        server.receive_packet(&client_packets[0].1);
         server.send_packet(b"pong");
-        let server_packets = server.take_outgoing_packets();
-
-        // Client receives response (contains ack)
-        client.receive_packet(&server_packets[0].1);
+        server.drain_outgoing(|_, data| client.receive_packet(data));
 
         // Check that client got an ack
         let acks = client.get_acks();
@@ -672,17 +740,17 @@ mod tests {
         client.send_packet(&data);
 
         // Should be fragmented
-        let outgoing = client.take_outgoing_packets();
-        assert!(outgoing.len() > 1);
-        assert_eq!(client.counters().fragments_sent, outgoing.len() as u64);
-
-        // Server receives all fragments
-        for (_, packet_data) in &outgoing {
-            server.receive_packet(packet_data);
-        }
+        let mut frag_count = 0usize;
+        client.drain_outgoing(|_, wire| {
+            frag_count += 1;
+            server.receive_packet(wire);
+        });
+        assert!(frag_count > 1);
+        assert_eq!(client.counters().fragments_sent, frag_count as u64);
 
         // Check reassembled packet
-        let incoming = server.take_incoming_packets();
+        let mut incoming: Vec<(u16, Vec<u8>)> = Vec::new();
+        server.drain_incoming(|seq, d| incoming.push((seq, d.to_vec())));
         assert_eq!(incoming.len(), 1);
         assert_eq!(incoming[0].1, data);
     }
@@ -700,20 +768,22 @@ mod tests {
         let data: Vec<u8> = (0..500).map(|i| (i % 256) as u8).collect();
         client.send_packet(&data);
 
-        // Should be fragmented
-        let mut outgoing = client.take_outgoing_packets();
+        // Collect datagrams first so we can reverse order
+        let mut outgoing: Vec<(u16, Vec<u8>)> = Vec::new();
+        client.drain_outgoing(|seq, d| outgoing.push((seq, d.to_vec())));
         assert!(outgoing.len() > 1);
 
         // Reverse order
         outgoing.reverse();
 
         // Server receives all fragments out of order
-        for (_, packet_data) in &outgoing {
-            server.receive_packet(packet_data);
+        for (_, wire) in &outgoing {
+            server.receive_packet(wire);
         }
 
         // Check reassembled packet
-        let incoming = server.take_incoming_packets();
+        let mut incoming: Vec<(u16, Vec<u8>)> = Vec::new();
+        server.drain_incoming(|seq, d| incoming.push((seq, d.to_vec())));
         assert_eq!(incoming.len(), 1);
         assert_eq!(incoming[0].1, data);
     }
@@ -726,21 +796,23 @@ mod tests {
         // Initial RTT should be 0
         assert_eq!(client.rtt(), 0.0);
 
-        // Simulate round trip
+        // Simulate round trip - collect ping wire bytes
         client.send_packet(b"ping");
-        let packets = client.take_outgoing_packets();
+        let mut ping_wire: Option<Vec<u8>> = None;
+        client.drain_outgoing(|_, d| ping_wire = Some(d.to_vec()));
 
         // Advance time
         client.update(0.050); // 50ms
         server.update(0.050);
 
-        server.receive_packet(&packets[0].1);
+        server.receive_packet(ping_wire.as_deref().unwrap());
         server.send_packet(b"pong");
-        let response = server.take_outgoing_packets();
+        let mut pong_wire: Option<Vec<u8>> = None;
+        server.drain_outgoing(|_, d| pong_wire = Some(d.to_vec()));
 
         // More time passes
         client.update(0.100); // 100ms total
-        client.receive_packet(&response[0].1);
+        client.receive_packet(pong_wire.as_deref().unwrap());
 
         // RTT should be approximately 100ms
         assert!(client.rtt() > 0.0);
@@ -753,15 +825,16 @@ mod tests {
         // Force sequence near wrap-around
         for _ in 0..65534 {
             endpoint.send_packet(b"x");
-            endpoint.take_outgoing_packets(); // Drain
+            endpoint.drain_outgoing(|_, _| {}); // Drain
         }
 
         // Should handle wrap-around
         endpoint.send_packet(b"wrap1");
         endpoint.send_packet(b"wrap2");
 
-        let packets = endpoint.take_outgoing_packets();
-        assert_eq!(packets.len(), 2);
+        let mut count = 0usize;
+        endpoint.drain_outgoing(|_, _| count += 1);
+        assert_eq!(count, 2);
     }
 
     #[test]
@@ -769,7 +842,7 @@ mod tests {
         let mut endpoint = create_test_endpoint("test");
 
         endpoint.send_packet(b"data");
-        endpoint.take_outgoing_packets();
+        endpoint.drain_outgoing(|_, _| {});
 
         endpoint.reset();
 

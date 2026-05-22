@@ -84,11 +84,15 @@ Benchmarks are the final authority.
 
 | Metric                   | Target    | Current   | Status |
 |--------------------------|-----------|-----------|--------|
-| Small packet latency     | < 200 ns  | ~79 ns    | OK     |
-| Header read              | < 5 ns    | ~1.3 ns   | OK     |
-| Header write             | < 10 ns   | ~2.9 ns   | OK     |
-| Throughput (fragmented)  | > 5 GiB/s | 7.3 GiB/s | OK     |
-| Full roundtrip (32 pkts) | < 10 us   | ~2.9 us   | OK     |
+| Small packet latency     | < 200 ns  | ~40 ns    | OK     |
+| Header read              | < 5 ns    | ~1.4 ns   | OK     |
+| Header write             | < 10 ns   | ~3.1 ns   | OK     |
+| Throughput (fragmented)  | > 5 GiB/s | ~13 GiB/s | OK     |
+| Full roundtrip (32 pkts) | < 10 us   | ~2.3 us   | OK     |
+
+> Updated 2026-05-22 after Steps 4-7 zero-alloc refactor (v0.2.0). Previous baseline:
+> ~79 ns small packet, 7.3 GiB/s fragmented, ~2.9 us roundtrip.
+> All metrics improved: small packet -49%, fragmented throughput +78%, roundtrip -21%.
 
 ### Regression Policy
 

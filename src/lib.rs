@@ -47,20 +47,25 @@
 //! // Client queues a packet for transmission
 //! client.send_packet(b"Hello, Server!");
 //!
-//! // Hand outgoing wire bytes to the UDP layer
-//! let outgoing = client.take_outgoing_packets();
-//! for (_, bytes) in &outgoing {
+//! // Hand outgoing wire bytes to the UDP layer (zero-alloc)
+//! let mut outgoing: Vec<Vec<u8>> = Vec::new();
+//! client.drain_outgoing(|_, bytes| outgoing.push(bytes.to_vec()));
+//! for bytes in &outgoing {
 //!     server.receive_packet(bytes);
 //! }
 //!
-//! // Read the reassembled payload
-//! let received = server.take_incoming_packets();
-//! assert_eq!(&received[0].1, b"Hello, Server!");
+//! // Read the reassembled payload (zero-alloc)
+//! let mut payload: Vec<u8> = Vec::new();
+//! server.drain_incoming(|_, data| payload = data.to_vec());
+//! assert_eq!(payload, b"Hello, Server!");
 //!
 //! // Server response carries a piggy-backed ACK for the client's packet
 //! server.send_packet(b"Hello, Client!");
-//! let response = server.take_outgoing_packets();
-//! client.receive_packet(&response[0].1);
+//! let mut response: Vec<Vec<u8>> = Vec::new();
+//! server.drain_outgoing(|_, bytes| response.push(bytes.to_vec()));
+//! for bytes in &response {
+//!     client.receive_packet(bytes);
+//! }
 //!
 //! // Client now knows its packet was acknowledged
 //! let acks = client.get_acks();
@@ -75,6 +80,7 @@ mod config;
 mod endpoint;
 mod fragment;
 mod packet;
+mod packet_queue;
 mod sequence_buffer;
 mod utils;
 
@@ -129,6 +135,6 @@ mod tests {
 
     #[test]
     fn test_library_version() {
-        assert!(env!("CARGO_PKG_VERSION").starts_with("0.1"));
+        assert!(env!("CARGO_PKG_VERSION").starts_with("0.2"));
     }
 }

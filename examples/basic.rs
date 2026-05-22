@@ -23,30 +23,27 @@ fn main() {
         let message = format!("Frame {}", frame);
         client.send_packet(message.as_bytes());
 
-        // Get packets to "send" over network
-        for (seq, data) in client.take_outgoing_packets() {
+        // Get packets to "send" over network (zero-alloc)
+        client.drain_outgoing(|seq, data| {
             println!("Client sent packet {} ({} bytes)", seq, data.len());
-
             // In real code, send over UDP socket
             // For demo, pass directly to server
-            server.receive_packet(&data);
-        }
+            server.receive_packet(data);
+        });
 
         // Server processes received packets
-        for (seq, data) in server.take_incoming_packets() {
-            let msg = String::from_utf8_lossy(&data);
+        server.drain_incoming(|seq, data| {
+            let msg = String::from_utf8_lossy(data);
             println!("Server received packet {}: {}", seq, msg);
-        }
+        });
 
         // Server sends response
         server.send_packet(b"ACK");
 
-        for (_seq, data) in server.take_outgoing_packets() {
-            client.receive_packet(&data);
-        }
+        server.drain_outgoing(|_, data| client.receive_packet(data));
 
         // Process client's incoming packets (ACKs)
-        client.take_incoming_packets();
+        client.drain_incoming(|_, _| {});
 
         // Check for acknowledged packets
         for ack in client.get_acks() {

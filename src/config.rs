@@ -104,6 +104,19 @@ pub struct EndpointConfig {
     /// Default 28 = 20 bytes IPv4 + 8 bytes UDP. Adjust for IPv6 (48) or
     /// tunnelled transports.
     pub packet_header_size: usize,
+
+    /// Number of slots in the outgoing packet ring buffer (power-of-two).
+    ///
+    /// Each slot holds one UDP datagram sized to [`EndpointConfig::max_datagram_size`].
+    /// Increase if the application may queue many packets per tick before draining.
+    pub outgoing_queue_size: usize,
+
+    /// Number of slots in the incoming packet ring buffer (power-of-two).
+    ///
+    /// Each slot holds one reassembled logical payload sized to
+    /// [`EndpointConfig::max_packet_size`]. Increase if many packets may
+    /// arrive between [`Endpoint::drain_incoming`] calls.
+    pub incoming_queue_size: usize,
 }
 
 impl Default for EndpointConfig {
@@ -122,6 +135,8 @@ impl Default for EndpointConfig {
             packet_loss_smoothing_factor: 0.1,
             bandwidth_smoothing_factor: 0.1,
             packet_header_size: 28, // 20 (IP) + 8 (UDP)
+            outgoing_queue_size: 256,
+            incoming_queue_size: 256,
         }
     }
 }
@@ -133,6 +148,16 @@ impl EndpointConfig {
             name: name.into(),
             ..Default::default()
         }
+    }
+
+    /// Maximum size of a single outgoing UDP datagram in bytes.
+    ///
+    /// Computed as `fragment_size + FRAGMENT_HEADER_BYTES + MAX_PACKET_HEADER_BYTES`.
+    /// This is the required `slot_capacity` for the outgoing [`PacketQueue`].
+    pub fn max_datagram_size(&self) -> usize {
+        self.fragment_size
+            + crate::fragment::FRAGMENT_HEADER_BYTES
+            + crate::packet::MAX_PACKET_HEADER_BYTES
     }
 
     /// Validate the configuration and return a descriptive error if it is invalid.
@@ -198,6 +223,14 @@ impl EndpointConfig {
 
         if !(0.0..=1.0).contains(&self.bandwidth_smoothing_factor) {
             return Err("bandwidth_smoothing_factor must be between 0.0 and 1.0".to_string());
+        }
+
+        if self.outgoing_queue_size == 0 || !self.outgoing_queue_size.is_power_of_two() {
+            return Err("outgoing_queue_size must be a positive power of two".to_string());
+        }
+
+        if self.incoming_queue_size == 0 || !self.incoming_queue_size.is_power_of_two() {
+            return Err("incoming_queue_size must be a positive power of two".to_string());
         }
 
         Ok(())
